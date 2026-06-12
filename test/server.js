@@ -116,6 +116,145 @@ async function main() {
     assert.equal(srv.rooms.get(r2.body.code).seats[0].name, 'Player 1');
   });
 
+  // ---- game flow: start / actions / permissions / undo ----
+  // These reach into srv.rooms (same process) to patch state deterministically —
+  // engine shuffles are random, so tests construct the scenarios they need.
+  function patchState(code, fn) {
+    const r = srv.rooms.get(code);
+    const g = JSON.parse(r.state);
+    fn(g);
+    r.state = JSON.stringify(g);
+    return g;
+  }
+  const stateOf = code => JSON.parse(srv.rooms.get(code).state);
+
+  let g2; // 2-player game: {code, alice, bob}
+  await t('start requires host', async () => {
+    const c = await post('/api/rooms', { name: 'Alice' });
+    const j = await post(`/api/rooms/${c.body.code}/join`, { name: 'Bob' });
+    g2 = { code: c.body.code, alice: c.body.token, bob: j.body.token };
+    const r = await post(`/api/rooms/${g2.code}/start`, { token: g2.bob, epidemics: 4 });
+    assert.equal(r.status, 403);
+  });
+
+  await t('host starts the game', async () => {
+    const r = await post(`/api/rooms/${g2.code}/start`, { token: g2.alice, epidemics: 4 });
+    assert.equal(r.status, 200);
+    const g = stateOf(g2.code);
+    assert.equal(g.players.length, 2);
+    assert.equal(g.players[0].name, 'Alice');
+    assert.equal(g.phase, 'actions');
+    assert.equal(srv.rooms.get(g2.code).status, 'playing');
+  });
+
+  await t('start twice is rejected', async () => {
+    const r = await post(`/api/rooms/${g2.code}/start`, { token: g2.alice, epidemics: 4 });
+    assert.equal(r.status, 409);
+  });
+
+  await t('action by wrong seat is 403', async () => {
+    const r = await post(`/api/rooms/${g2.code}/action`, { token: g2.bob, fn: 'pass', args: [] });
+    assert.equal(r.status, 403);
+    assert.match(r.body.error, /turn/);
+  });
+
+  await t('non-whitelisted fn is rejected', async () => {
+    const r = await post(`/api/rooms/${g2.code}/action`, { token: g2.alice, fn: 'newGame', args: [{}] });
+    assert.equal(r.status, 400);
+  });
+
+  await t('current player moves; state advances', async () => {
+    const r = await post(`/api/rooms/${g2.code}/action`,
+      { token: g2.alice, fn: 'performMove', args: [0, 'drive', 'Chicago'] });
+    assert.equal(r.status, 200);
+    assert.equal(stateOf(g2.code).players[0].location, 'Chicago');
+    assert.equal(stateOf(g2.code).actionsLeft, 3);
+  });
+
+  await t('illegal engine move is 400 with engine message', async () => {
+    const r = await post(`/api/rooms/${g2.code}/action`,
+      { token: g2.alice, fn: 'performMove', args: [0, 'drive', 'Tokyo'] });
+    assert.equal(r.status, 400);
+    assert.match(r.body.error, /not connected/);
+  });
+
+  await t('undo restores pre-move state, current player only', async () => {
+    const deny = await post(`/api/rooms/${g2.code}/undo`, { token: g2.bob });
+    assert.equal(deny.status, 403);
+    const r = await post(`/api/rooms/${g2.code}/undo`, { token: g2.alice });
+    assert.equal(r.status, 200);
+    assert.equal(stateOf(g2.code).players[0].location, 'Atlanta');
+    assert.equal(stateOf(g2.code).actionsLeft, 4);
+    const empty = await post(`/api/rooms/${g2.code}/undo`, { token: g2.alice });
+    assert.equal(empty.status, 400); // nothing left to undo
+  });
+
+  await t('drawPlayerCard returns the drawn card', async () => {
+    // burn alice's actions deterministically, then stack the deck with two
+    // city cards so no epidemic interrupts the draw phase
+    await post(`/api/rooms/${g2.code}/action`, { token: g2.alice, fn: 'pass', args: [] });
+    patchState(g2.code, g => {
+      g.playerDeck.push({ type: 'city', city: 'Lima', color: 'yellow' },
+                        { type: 'city', city: 'Paris', color: 'blue' });
+    });
+    const r = await post(`/api/rooms/${g2.code}/action`, { token: g2.alice, fn: 'drawPlayerCard', args: [] });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ret.city, 'Paris'); // top of deck = end of array
+    const r2 = await post(`/api/rooms/${g2.code}/action`, { token: g2.alice, fn: 'drawPlayerCard', args: [] });
+    assert.equal(r2.body.ret.city, 'Lima');
+    assert.equal(stateOf(g2.code).phase, 'infect');
+  });
+
+  await t('turn handoff clears undo snapshots', async () => {
+    const room = srv.rooms.get(g2.code);
+    const flips = stateOf(g2.code).infectsLeft;
+    for (let i = 0; i < flips; i++) {
+      const r = await post(`/api/rooms/${g2.code}/action`, { token: g2.alice, fn: 'flipInfectionCard', args: [] });
+      assert.equal(r.status, 200);
+    }
+    assert.equal(stateOf(g2.code).current, 1); // bob's turn now
+    assert.equal(room.turnSnapshots.length, 0);
+    const r = await post(`/api/rooms/${g2.code}/undo`, { token: g2.bob });
+    assert.equal(r.status, 400); // bob has done nothing yet
+  });
+
+  await t('events: own-seat only, and playEvent voids undo', async () => {
+    // give alice an Airlift, have bob (current) move once, then alice plays it
+    patchState(g2.code, g => { g.players[0].hand.push({ type: 'event', event: 'Airlift' }); });
+    await post(`/api/rooms/${g2.code}/action`, { token: g2.bob, fn: 'performMove', args: [1, 'drive', 'Chicago'] });
+    assert.equal(srv.rooms.get(g2.code).turnSnapshots.length, 1);
+    const wrong = await post(`/api/rooms/${g2.code}/action`,
+      { token: g2.bob, fn: 'playEvent', args: [0, 'hand', 'Airlift', { pawnIdx: 0, city: 'Miami' }] });
+    assert.equal(wrong.status, 403);
+    const r = await post(`/api/rooms/${g2.code}/action`,
+      { token: g2.alice, fn: 'playEvent', args: [0, 'hand', 'Airlift', { pawnIdx: 0, city: 'Miami' }] });
+    assert.equal(r.status, 200);
+    assert.equal(stateOf(g2.code).players[0].location, 'Miami');
+    assert.equal(srv.rooms.get(g2.code).turnSnapshots.length, 0); // events void undo
+  });
+
+  await t('forecastCommit allowed only for the player who played Forecast', async () => {
+    patchState(g2.code, g => { g.players[0].hand.push({ type: 'event', event: 'Forecast' }); });
+    const r = await post(`/api/rooms/${g2.code}/action`,
+      { token: g2.alice, fn: 'playEvent', args: [0, 'hand', 'Forecast', {}] });
+    assert.equal(r.status, 200);
+    const n = stateOf(g2.code).forecastPending.length;
+    const order = Array.from({ length: n }, (_, i) => i);
+    const wrong = await post(`/api/rooms/${g2.code}/action`,
+      { token: g2.bob, fn: 'forecastCommit', args: [order] });
+    assert.equal(wrong.status, 403);
+    const ok = await post(`/api/rooms/${g2.code}/action`,
+      { token: g2.alice, fn: 'forecastCommit', args: [order] });
+    assert.equal(ok.status, 200);
+    assert.equal(stateOf(g2.code).forecastPending, null);
+  });
+
+  await t('action on a lobby room is 409', async () => {
+    const c = await post('/api/rooms', { name: 'Solo' });
+    const r = await post(`/api/rooms/${c.body.code}/action`, { token: c.body.token, fn: 'pass', args: [] });
+    assert.equal(r.status, 409);
+  });
+
   server.close();
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

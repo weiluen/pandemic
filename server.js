@@ -72,8 +72,75 @@ function createRoom(body) {
 
 function touch(room) { room.lastActivity = Date.now(); }
 
-// Placeholder until SSE lands: roster/state changed, notify clients.
-function broadcast(room) { room.seq++; }
+// Everything a client needs to render: full engine state + roster. Identical
+// for everyone except mySeat (stamped per connection) and actorSeat (set on
+// action-triggered broadcasts so the actor's own UI can skip replaying
+// animations it already played locally).
+function payload(room, seat, actorSeat) {
+  return {
+    seq: room.seq,
+    code: room.code,
+    status: room.status,
+    seats: room.seats.map((s, i) => ({ name: s.name, connected: s.connected > 0, host: i === 0 })),
+    mySeat: seat,
+    forecastBy: room.forecastBy,
+    undoDepth: room.turnSnapshots.length,
+    actorSeat: actorSeat === undefined ? null : actorSeat,
+    state: room.state,
+  };
+}
+
+function broadcast(room, actorSeat) {
+  room.seq++;
+  for (const c of room.sseClients) {
+    c.res.write(`data: ${JSON.stringify(payload(room, c.seat, actorSeat))}\n\n`);
+  }
+}
+
+// ---------------- permissions & engine application ----------------
+
+// Mutating engine functions a client may invoke. Anything else is rejected.
+const CURRENT_ONLY = new Set(['performMove', 'treat', 'build', 'discoverCure', 'shareKnowledge',
+  'pass', 'contingencyTake', 'drawPlayerCard', 'intensify', 'flipInfectionCard']);
+const ENGINE_FNS = new Set([...CURRENT_ONLY, 'discardForLimit', 'playEvent', 'forecastCommit']);
+
+// Strict seats: who may call what. Returns an error string or null.
+function permitted(room, seat, fn, args) {
+  const g = JSON.parse(room.state);
+  if (CURRENT_ONLY.has(fn)) {
+    return seat === g.current ? null : `it is ${g.players[g.current].name}'s turn`;
+  }
+  if (fn === 'discardForLimit') return seat === args[0] ? null : 'you can only discard your own cards';
+  if (fn === 'playEvent') return seat === args[0] ? null : 'you can only play your own event cards';
+  if (fn === 'forecastCommit') {
+    return seat === room.forecastBy ? null : 'only the player who played Forecast can set the order';
+  }
+  return 'unknown action';
+}
+
+// State-swap application: game.js holds a singleton G, so restore the room's
+// state, mutate, snapshot it back. Node is single-threaded — race-free.
+function applyAction(room, seat, fn, args) {
+  const before = JSON.parse(room.state);
+  Game.restore(room.state);
+  let ret;
+  try { ret = Game[fn](...args); }
+  catch (e) { return { error: e.message.replace(/^Illegal: /, '') }; }
+  const prev = room.state;
+  room.state = Game.snapshot();
+  const after = JSON.parse(room.state);
+
+  // Undo bookkeeping (mirrors the hotseat UI: events void undo; a new turn
+  // clears the stack so nobody rewinds someone else's turn).
+  if (fn === 'playEvent') room.turnSnapshots = [];
+  else if (seat === before.current) room.turnSnapshots.push(prev);
+  if (after.current !== before.current || after.turn !== before.turn) room.turnSnapshots = [];
+
+  if (fn === 'playEvent' && args[2] === 'Forecast') room.forecastBy = seat;
+  if (fn === 'forecastCommit') room.forecastBy = null;
+  if (after.result) room.status = 'over';
+  return { ret: ret === undefined ? null : ret };
+}
 
 // ---------------- helpers ----------------
 
@@ -160,6 +227,58 @@ async function apiRooms(req, res, url, code, sub) {
     touch(room);
     broadcast(room);
     return sendJSON(res, 200, { token, seat: room.seats.length - 1 });
+  }
+
+  if (sub === 'start' && req.method === 'POST') {
+    const body = await readBody(req);
+    if (body.token !== room.hostToken) return sendJSON(res, 403, { error: 'only the host can start the game' });
+    if (room.status !== 'lobby') return sendJSON(res, 409, { error: 'game already started' });
+    const epidemics = [4, 5, 6].includes(+body.epidemics) ? +body.epidemics : 4;
+    const roles = Array.isArray(body.roles) && body.roles.every(Boolean) ? body.roles : null;
+    try {
+      Game.newGame({ names: room.seats.map(s => s.name), epidemics, roles });
+    } catch (e) {
+      return sendJSON(res, 400, { error: e.message.replace(/^Illegal: /, '') });
+    }
+    room.state = Game.snapshot();
+    room.status = 'playing';
+    room.turnSnapshots = [];
+    room.forecastBy = null;
+    touch(room);
+    broadcast(room);
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (sub === 'action' && req.method === 'POST') {
+    const body = await readBody(req);
+    const seat = seatByToken(room, body.token);
+    if (seat < 0) return sendJSON(res, 403, { error: 'not a player in this room' });
+    if (room.status !== 'playing') {
+      return sendJSON(res, 409, { error: room.status === 'lobby' ? 'game not started' : 'game is over' });
+    }
+    if (!ENGINE_FNS.has(body.fn)) return sendJSON(res, 400, { error: 'unknown action' });
+    const args = Array.isArray(body.args) ? body.args : [];
+    const denied = permitted(room, seat, body.fn, args);
+    if (denied) return sendJSON(res, 403, { error: denied });
+    const out = applyAction(room, seat, body.fn, args);
+    if (out.error) return sendJSON(res, 400, { error: out.error });
+    touch(room);
+    broadcast(room, seat);
+    return sendJSON(res, 200, { ok: true, ret: out.ret, room: payload(room, seat, seat) });
+  }
+
+  if (sub === 'undo' && req.method === 'POST') {
+    const body = await readBody(req);
+    const seat = seatByToken(room, body.token);
+    if (seat < 0) return sendJSON(res, 403, { error: 'not a player in this room' });
+    if (room.status !== 'playing') return sendJSON(res, 409, { error: 'game not in progress' });
+    const g = JSON.parse(room.state);
+    if (seat !== g.current) return sendJSON(res, 403, { error: 'only the current player can undo' });
+    if (!room.turnSnapshots.length) return sendJSON(res, 400, { error: 'nothing to undo' });
+    room.state = room.turnSnapshots.pop();
+    touch(room);
+    broadcast(room, seat);
+    return sendJSON(res, 200, { ok: true, room: payload(room, seat, seat) });
   }
 
   return sendJSON(res, 404, { error: 'unknown api route' });
