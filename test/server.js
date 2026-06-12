@@ -329,6 +329,51 @@ async function main() {
     es2.close();
   });
 
+  // ---- lobby leave & kick ----
+  await t('non-host leave frees the seat', async () => {
+    const c = await post('/api/rooms', { name: 'Host' });
+    const j = await post(`/api/rooms/${c.body.code}/join`, { name: 'Quitter' });
+    const r = await post(`/api/rooms/${c.body.code}/leave`, { token: j.body.token });
+    assert.equal(r.status, 200);
+    assert.equal(srv.rooms.get(c.body.code).seats.length, 1);
+    const again = await post(`/api/rooms/${c.body.code}/join`, { name: 'Next' });
+    assert.equal(again.body.seat, 1); // freed seat is reusable
+  });
+
+  await t('host leave disbands the room', async () => {
+    const c = await post('/api/rooms', { name: 'Host' });
+    const r = await post(`/api/rooms/${c.body.code}/leave`, { token: c.body.token });
+    assert.equal(r.status, 200);
+    const j = await post(`/api/rooms/${c.body.code}/join`, { name: 'Late' });
+    assert.equal(j.status, 404);
+  });
+
+  await t('leave mid-game is rejected (disconnect/rejoin instead)', async () => {
+    const c = await post('/api/rooms', { name: 'A' });
+    const j = await post(`/api/rooms/${c.body.code}/join`, { name: 'B' });
+    await post(`/api/rooms/${c.body.code}/start`, { token: c.body.token, epidemics: 4 });
+    const r = await post(`/api/rooms/${c.body.code}/leave`, { token: j.body.token });
+    assert.equal(r.status, 409);
+  });
+
+  await t('host can kick a lobby seat; kicked SSE client is told', async () => {
+    const c = await post('/api/rooms', { name: 'Host' });
+    const j = await post(`/api/rooms/${c.body.code}/join`, { name: 'Ghost' });
+    const es = sseOpen(`/api/rooms/${c.body.code}/events?token=${j.body.token}`);
+    await es.next(); // hello
+    const deny = await post(`/api/rooms/${c.body.code}/kick`, { token: j.body.token, seat: 0 });
+    assert.equal(deny.status, 403); // only the host kicks
+    const r = await post(`/api/rooms/${c.body.code}/kick`, { token: c.body.token, seat: 1 });
+    assert.equal(r.status, 200);
+    assert.equal(srv.rooms.get(c.body.code).seats.length, 1);
+    let kicked = null;
+    for (let i = 0; i < 3; i++) { const ev = await es.next(); if (ev.kicked) { kicked = ev; break; } }
+    assert.ok(kicked, 'kicked client should receive a kicked event');
+    es.close();
+    const self = await post(`/api/rooms/${c.body.code}/kick`, { token: c.body.token, seat: 0 });
+    assert.equal(self.status, 400); // host cannot kick themselves
+  });
+
   // ---- persistence ----
   await t('rooms persist to disk and reload', async () => {
     srv.saveNow();

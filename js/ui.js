@@ -78,6 +78,8 @@
 
   let actx = null;
   let muted = localStorage.getItem('pandemic-muted') === '1';
+  // Spoken storyteller narration of the news beats (independent of SFX mute).
+  let narrator = localStorage.getItem('pandemic-narrator') === '1';
   function audio() {
     if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
     if (actx.state === 'suspended') actx.resume();
@@ -128,6 +130,99 @@
   function sfx(name) {
     if (muted) return;
     try { SFX[name] && SFX[name](); } catch (e) { /* audio blocked until first gesture */ }
+  }
+
+  // ================= Storyteller narration (spoken news) =================
+  // Each new news beat is spoken aloud once, in order: a pre-generated premium
+  // voiceover clip (audio/narration/<id>.mp3) when the beat carries an `audio`
+  // id, otherwise the browser's built-in speech synthesizer as a fallback for
+  // the dynamic lines. Clips are produced by tools/generate-narration.mjs.
+  const MAX_NARRATION_QUEUE = 8; // outbreak chains can emit many beats at once
+  const speech = { seen: 0, primed: false, queue: [], playing: false, audioEl: null };
+
+  // Establish the baseline so we don't replay an existing backlog. fromStart
+  // (new game) speaks from the very first beat; resume starts from "now".
+  function armNarrator(fromStart) {
+    stopNarration();
+    speech.queue.length = 0;
+    speech.primed = true;
+    const g = G();
+    const count = g ? g.log.filter(e => e.cls === 'news').length : 0;
+    speech.seen = fromStart ? 0 : count;
+  }
+
+  function stopNarration() {
+    speech.playing = false;
+    speech.queue.length = 0;
+    if (speech.audioEl) { try { speech.audioEl.pause(); } catch (e) {} speech.audioEl = null; }
+    try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) {}
+  }
+
+  let _ttsVoice = undefined;
+  function pickVoice() {
+    if (_ttsVoice !== undefined) return _ttsVoice;
+    const vs = (window.speechSynthesis && speechSynthesis.getVoices()) || [];
+    // Prefer a deep / characterful English narrator when one is installed.
+    const pref = ['Daniel', 'Google UK English Male', 'Microsoft Guy', 'Microsoft David', 'Arthur', 'Rishi', 'Alex'];
+    _ttsVoice = vs.find(v => pref.some(p => v.name.includes(p)))
+      || vs.find(v => /^en[-_]GB/i.test(v.lang) && /male/i.test(v.name))
+      || vs.find(v => /^en[-_]/i.test(v.lang)) || vs[0] || null;
+    return _ttsVoice;
+  }
+  if (window.speechSynthesis) speechSynthesis.onvoiceschanged = () => { _ttsVoice = undefined; };
+
+  function speakBuiltin(text, done) {
+    if (!window.speechSynthesis) { done(); return; }
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      const v = pickVoice(); if (v) u.voice = v;
+      u.rate = 0.98; u.pitch = 0.9; // a touch slow and low for drama
+      u.onend = done; u.onerror = done;
+      speechSynthesis.speak(u);
+    } catch (e) { done(); }
+  }
+
+  function playNextNarration() {
+    if (speech.playing || !narrator || !speech.queue.length) return;
+    const item = speech.queue.shift();
+    speech.playing = true;
+    const done = () => { speech.playing = false; speech.audioEl = null; playNextNarration(); };
+    if (item.audio) {
+      const el = new Audio(`audio/narration/${item.audio}.mp3`);
+      speech.audioEl = el;
+      el.onended = done;
+      // Missing clip (not generated yet) or playback error → built-in voice.
+      el.onerror = () => { speech.audioEl = null; speakBuiltin(item.text, done); };
+      const p = el.play();
+      if (p && p.catch) p.catch(() => { speech.audioEl = null; speakBuiltin(item.text, done); });
+    } else {
+      speakBuiltin(item.text, done);
+    }
+  }
+
+  // Called from refresh(): enqueue any news beats that appeared since last sync.
+  function narratorSync() {
+    const g = G();
+    if (!g) return;
+    const news = g.log.filter(e => e.cls === 'news');
+    if (!speech.primed) { speech.seen = news.length; speech.primed = true; } // safety: never replay on cold entry
+    if (news.length < speech.seen) { speech.seen = news.length; speech.queue.length = 0; } // new game / undo / trim
+    if (narrator) {
+      for (const e of news.slice(speech.seen)) {
+        speech.queue.push({ audio: e.audio, text: e.msg.replace(/^📰\s*/, '') });
+      }
+      if (speech.queue.length > MAX_NARRATION_QUEUE) speech.queue.splice(0, speech.queue.length - MAX_NARRATION_QUEUE);
+      playNextNarration();
+    }
+    speech.seen = news.length; // keep pointer current even when muted, so toggling on starts from "now"
+  }
+
+  function toggleNarrator() {
+    narrator = !narrator;
+    localStorage.setItem('pandemic-narrator', narrator ? '1' : '0');
+    if (!narrator) stopNarration();
+    else if (window.speechSynthesis) { try { speechSynthesis.getVoices(); } catch (e) {} } // warm up voice list
+    renderTopbar();
   }
 
   let toastTimer = null;
@@ -292,6 +387,7 @@
           onclick: () => {
             try {
               Game.load(saved);
+              armNarrator(false); // resumed game: don't replay the backlog
               box.hidden = true; $('#app').hidden = false; ui.undoStack = []; ui.resultPlayed = false; refresh();
             } catch (e) {
               showErr('Could not load the saved game: ' + e.message);
@@ -325,6 +421,7 @@
                 for (let i = 0; i < count; i++) if (!roles[i]) roles[i] = pool.pop();
               }
               Game.newGame({ names, epidemics: +epiSel.value, roles: chosen.length ? roles : null, ais });
+              armNarrator(true); // fresh game: narrate from the opening bulletin
               ui.undoStack = [];
               ui.resultPlayed = false;
               ui.turnKey = null;
@@ -364,7 +461,11 @@
         codeIn,
         el('button', {
           onclick: async () => {
-            try { await Net.join(codeIn.value, myName()); } catch (e) { oerr.textContent = e.message; }
+            try { await Net.join(codeIn.value, myName()); } catch (e) {
+              oerr.textContent = e.message + (/no such room/.test(e.message)
+                ? ' — check that you and the host are on the SAME server address (rooms don’t carry across servers).'
+                : '');
+            }
           },
         }, 'Join Room')));
       odlg.append(oerr);
@@ -388,7 +489,11 @@
     Net.seats.forEach((s, i) => {
       list.append(el('div', { class: 'setuprow' },
         el('span', { class: 'connDot', style: `background:${s.connected ? 'var(--good)' : 'var(--bad)'}` }),
-        el('label', {}, `${i + 1}. ${s.name}${i === 0 ? ' (host)' : ''}${i === Net.seat ? ' — you' : ''}`)));
+        el('label', {}, `${i + 1}. ${s.name}${i === 0 ? ' (host)' : ''}${i === Net.seat ? ' — you' : ''}`),
+        isHost && i > 0 ? el('button', {
+          class: 'closex', title: `Remove ${s.name} from the room`, style: 'position:static;margin-left:auto',
+          onclick: async () => { try { await Net.kick(i); } catch (e) { toast(e.message); } },
+        }, '✕') : null));
     });
     for (let i = Net.seats.length; i < 4; i++) {
       list.append(el('div', { class: 'setuprow', style: 'opacity:.45' },
@@ -425,11 +530,19 @@
   }
 
   function leaveOnline() {
-    Net.leave();
+    Net.leaveRoom(); // frees the seat when in the lobby; mid-game just disconnects
     $('#app').hidden = true;
     ui.turnKey = null;
     showSetup();
   }
+
+  // Server ended our membership (kicked, or the host closed the room).
+  Net.onClosed = why => {
+    $('#app').hidden = true;
+    ui.turnKey = null;
+    showSetup();
+    toast(why);
+  };
 
   // On-demand viewer for the infection discard pile (public knowledge in Pandemic).
   function showInfectionPile() {
@@ -524,6 +637,11 @@
       title: muted ? 'Unmute sound effects' : 'Mute sound effects',
       onclick: () => { muted = !muted; localStorage.setItem('pandemic-muted', muted ? '1' : '0'); renderTopbar(); },
     }, muted ? '\u{1F507}' : '\u{1F50A}'));
+    bar.append(el('button', {
+      title: narrator ? 'Turn off the storyteller narration' : 'Turn on the storyteller narration',
+      style: narrator ? '' : 'opacity:.45',
+      onclick: toggleNarrator,
+    }, '\u{1F399}\u{FE0F}'));
     bar.append(el('button', { onclick: showHelp }, 'Rules'));
     bar.append(el('button', {
       class: 'danger', onclick: () => {
@@ -2002,6 +2120,7 @@
     renderStatus();
     renderLog();
     syncTicker();
+    narratorSync();
     renderStateModal();
     save();
     scheduleAI();
@@ -2086,6 +2205,7 @@
           localStorage.removeItem(SAVE_KEY);
           toast('Saved game was corrupted and has been discarded — please start a new game.');
         } else if (g && g.players && !g.result) {
+          armNarrator(false); // resumed game: don't replay the backlog
           $('#app').hidden = false;
           ui.undoStack = [];
           refresh();

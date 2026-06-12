@@ -60,6 +60,16 @@
 
   Net.undo = () => api(`/api/rooms/${Net.code}/undo`, { token: Net.token });
 
+  Net.kick = seat => api(`/api/rooms/${Net.code}/kick`, { token: Net.token, seat });
+
+  // Leave for real: free the seat on the server (lobby only — the server
+  // refuses mid-game, where closing the page and rejoining is the model),
+  // then tear down local state either way.
+  Net.leaveRoom = async function () {
+    try { await api(`/api/rooms/${Net.code}/leave`, { token: Net.token }); } catch (e) { /* room gone or game running */ }
+    Net.leave();
+  };
+
   function enter(code, token) {
     Net.online = true;
     Net.code = code; Net.token = token; Net.seq = 0;
@@ -75,6 +85,13 @@
   // of the same action can race safely.
   Net.applyPayload = function (p) {
     if (!Net.online || p.seq <= Net.seq) return;
+    if (p.kicked || p.closed) {
+      const why = p.kicked ? 'You were removed from the room.' : 'The host closed the room.';
+      const cb = Net.onClosed;
+      Net.leave();
+      if (cb) cb(why);
+      return;
+    }
     Net.seq = p.seq;
     Net.status = p.status; Net.seats = p.seats; Net.seat = p.mySeat;
     Net.forecastBy = p.forecastBy; Net.undoDepth = p.undoDepth;

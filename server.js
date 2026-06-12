@@ -92,9 +92,31 @@ function payload(room, seat, actorSeat) {
 
 function broadcast(room, actorSeat) {
   room.seq++;
-  for (const c of room.sseClients) {
-    c.res.write(`data: ${JSON.stringify(payload(room, c.seat, actorSeat))}\n\n`);
+  for (const c of room.sseClients.slice()) {
+    const seat = seatByToken(room, c.token);
+    if (seat < 0) {
+      // seat no longer exists (kicked): tell the client, then drop it
+      c.res.write(`data: ${JSON.stringify({ seq: room.seq, kicked: true })}\n\n`);
+      try { c.res.end(); } catch (e) {}
+      room.sseClients = room.sseClients.filter(x => x !== c);
+      continue;
+    }
+    c.res.write(`data: ${JSON.stringify(payload(room, seat, actorSeat))}\n\n`);
   }
+  scheduleSave();
+}
+
+// Disband a room: notify every connected client, close streams, delete.
+function closeRoom(room) {
+  room.seq++;
+  for (const c of room.sseClients) {
+    try {
+      c.res.write(`data: ${JSON.stringify({ seq: room.seq, closed: true })}\n\n`);
+      c.res.end();
+    } catch (e) {}
+  }
+  room.sseClients = [];
+  rooms.delete(room.code);
   scheduleSave();
 }
 
@@ -280,6 +302,34 @@ async function apiRooms(req, res, url, code, sub) {
     return sendJSON(res, 200, { token, seat: room.seats.length - 1 });
   }
 
+  if (sub === 'leave' && req.method === 'POST') {
+    const body = await readBody(req);
+    const seat = seatByToken(room, body.token);
+    if (seat < 0) return sendJSON(res, 403, { error: 'not a player in this room' });
+    if (room.status !== 'lobby') {
+      return sendJSON(res, 409, { error: 'cannot leave a running game — close the page; you can rejoin any time' });
+    }
+    if (seat === 0) { closeRoom(room); return sendJSON(res, 200, { ok: true, closed: true }); }
+    room.seats.splice(seat, 1);
+    touch(room);
+    broadcast(room);
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (sub === 'kick' && req.method === 'POST') {
+    const body = await readBody(req);
+    if (body.token !== room.hostToken) return sendJSON(res, 403, { error: 'only the host can remove a player' });
+    if (room.status !== 'lobby') return sendJSON(res, 409, { error: 'the game has already started' });
+    const seat = +body.seat;
+    if (!Number.isInteger(seat) || seat <= 0 || seat >= room.seats.length) {
+      return sendJSON(res, 400, { error: 'no such seat' });
+    }
+    room.seats.splice(seat, 1);
+    touch(room);
+    broadcast(room); // the kicked client's stream gets a {kicked:true} frame here
+    return sendJSON(res, 200, { ok: true });
+  }
+
   if (sub === 'start' && req.method === 'POST') {
     const body = await readBody(req);
     if (body.token !== room.hostToken) return sendJSON(res, 403, { error: 'only the host can start the game' });
@@ -327,16 +377,20 @@ async function apiRooms(req, res, url, code, sub) {
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
-    const client = { res, seat };
+    // Track by token, not seat index — seats shift when someone leaves or is
+    // kicked. seatObj is a stable reference for the connected counter.
+    const token = url.searchParams.get('token');
+    const seatObj = room.seats[seat];
+    const client = { res, token };
     room.sseClients.push(client);
-    room.seats[seat].connected++;
+    seatObj.connected++;
     touch(room);
     res.write(`retry: 1500\n\n`);
     broadcast(room); // everyone (incl. this client) sees the fresh roster
     req.on('close', () => {
       room.sseClients = room.sseClients.filter(c => c !== client);
-      room.seats[seat].connected = Math.max(0, room.seats[seat].connected - 1);
-      broadcast(room);
+      seatObj.connected = Math.max(0, seatObj.connected - 1);
+      if (rooms.has(room.code)) broadcast(room);
     });
     return;
   }
