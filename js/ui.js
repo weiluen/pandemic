@@ -542,6 +542,16 @@
       gl.append(svg('stop', { offset: '100%', 'stop-color': HEX[c], 'stop-opacity': 0 }));
       defs.append(gl);
     }
+    // research-station building face + shared cyan halo (also under the active pawn)
+    const stg = svg('linearGradient', { id: 'stationg', x1: 0, y1: 0, x2: 0, y2: 1 });
+    stg.append(svg('stop', { offset: '0%', 'stop-color': '#ffffff' }));
+    stg.append(svg('stop', { offset: '100%', 'stop-color': '#bfd3ea' }));
+    defs.append(stg);
+    const sgl = svg('radialGradient', { id: 'glow-station' });
+    sgl.append(svg('stop', { offset: '0%', 'stop-color': '#38bdf8', 'stop-opacity': 0.65 }));
+    sgl.append(svg('stop', { offset: '60%', 'stop-color': '#38bdf8', 'stop-opacity': 0.25 }));
+    sgl.append(svg('stop', { offset: '100%', 'stop-color': '#38bdf8', 'stop-opacity': 0 }));
+    defs.append(sgl);
     g.append(defs);
     for (let x = 125; x < BASE_W; x += 125) g.append(svg('line', { class: 'grat', x1: x, y1: 0, x2: x, y2: BASE_H }));
     for (let y = 130; y < BASE_H; y += 130) g.append(svg('line', { class: 'grat', x1: 0, y1: y, x2: BASE_W, y2: y }));
@@ -594,7 +604,7 @@
       }
       // current player's location ring
       if (g.players[g.current].location === c.name && !g.result) {
-        node.append(svg('circle', { class: 'pulse', cx: c.x, cy: c.y, r: 17, fill: 'none', stroke: '#38bdf8', 'stroke-width': 2 }));
+        node.append(svg('circle', { class: 'pulse', cx: c.x, cy: c.y, r: 20, fill: 'none', stroke: '#38bdf8', 'stroke-width': 3 }));
       }
       if (ui.selectedCity === c.name) {
         node.append(svg('circle', { cx: c.x, cy: c.y, r: 15, fill: 'none', stroke: '#ffffff', 'stroke-width': 2 }));
@@ -606,12 +616,21 @@
       node.append(svg('text', { class: 'citylabel', x: c.x, y: c.y + 24, 'text-anchor': 'middle' },
         `${EMOJI[c.name] ? EMOJI[c.name] + ' ' : ''}${c.name}`));
 
-      // research station
+      // research station: a glowing lab building with a medical cross
       if (g.stations.includes(c.name)) {
-        node.append(svg('path', {
-          d: `M ${c.x - 22} ${c.y + 3} h 11 v -8 l -5.5 -5 l -5.5 5 z`,
-          fill: '#f8fafc', stroke: '#0b1220', 'stroke-width': 1,
+        const sx = c.x - 24, sy = c.y - 2;
+        const st = svg('g', { class: 'station' });
+        st.append(svg('circle', { class: 'stationglow', cx: sx, cy: sy, r: 19, fill: 'url(#glow-station)' }));
+        st.append(svg('path', {
+          class: 'stationicon',
+          d: `M ${sx - 9} ${sy + 8} h 18 v -12 l -9 -8 l -9 8 z`,
+          fill: 'url(#stationg)', stroke: '#0e4f7a', 'stroke-width': 1.6, 'stroke-linejoin': 'round',
         }));
+        st.append(svg('path', {
+          d: `M ${sx - 1.8} ${sy - 3} h 3.6 v 3.2 h 3.2 v 3.6 h -3.2 v 3.2 h -3.6 v -3.2 h -3.2 v -3.6 h 3.2 z`,
+          fill: '#0891b2', style: 'pointer-events:none',
+        }));
+        node.append(st);
       }
       // cubes: one badge per color present
       const present = COLORS.filter(col => g.cityCubes[c.name][col] > 0);
@@ -637,13 +656,20 @@
       g.players.forEach((p, i) => {
         if (p.location !== c.name) return;
         const [dx, dy] = offsets[i];
+        const isMe = i === g.current && !g.result;
+        if (isMe) { // halo under the active player's pawn
+          node.append(svg('circle', {
+            class: 'pawnhalo', cx: c.x + dx, cy: c.y + dy, r: 14, fill: 'url(#glow-station)',
+          }));
+        }
         node.append(svg('path', {
-          d: PAWN, transform: `translate(${c.x + dx} ${c.y + dy}) scale(1.15)`,
-          fill: ROLE[p.role].color, stroke: i === g.current ? '#fff' : '#0b1220', 'stroke-width': 1.4,
+          class: 'pawnicon' + (isMe ? ' me' : ''),
+          d: PAWN, transform: `translate(${c.x + dx} ${c.y + dy}) scale(${isMe ? 1.8 : 1.45})`,
+          fill: ROLE[p.role].color, stroke: isMe ? '#fff' : '#0b1220', 'stroke-width': isMe ? 1.7 : 1.4,
           'stroke-linejoin': 'round',
         }));
         node.append(svg('text', {
-          x: c.x + dx, y: c.y + dy + 5.5, 'text-anchor': 'middle', 'font-size': 8, 'font-weight': 800, fill: '#0b1220',
+          x: c.x + dx, y: c.y + dy + 6, 'text-anchor': 'middle', 'font-size': isMe ? 10 : 9, 'font-weight': 800, fill: '#0b1220',
           style: 'pointer-events:none',
         }, i + 1));
       });
@@ -704,7 +730,8 @@
           if (act(() => Game.performMove(pawnIdx, o.type, name))) {
             sfx('move');
             cityPulse(name, '#38bdf8');
-            if (o.type !== 'drive') animateFlight(from, name); // a plane for every flight
+            if (o.type === 'drive') animateDrive(from, name); // a car for the road
+            else animateFlight(from, name); // a plane for every flight
             const cc = Game.CITY[name];
             animateViewTo(cc.x, cc.y, Math.min(view.w, 980)); // glide in on the pawn
           }
@@ -1300,6 +1327,81 @@
     })(t0);
   }
 
+  // A compact car silhouette pointing along +x, centered on the origin.
+  const CAR_PATH = 'M13,3 L13,0 Q13,-2 10,-2 L6,-2 L3,-6 L-5,-6 L-8,-2 L-11,-2 Q-13,-2 -13,0 L-13,3 Z ' +
+    'M-7,0.4 a2.6,2.6 0 1,0 0.001,5.2 Z M7,0.4 a2.6,2.6 0 1,0 0.001,5.2 Z';
+  // A little ferry pointing along +x: hull, cabin, and funnel.
+  const BOAT_PATH = 'M-14,1 L14,1 L9,7 L-10,7 Z M-7,1 L-7,-4 L5,-4 L5,1 Z M-2,-4 L-2,-8 L1,-8 L1,-4 Z';
+
+  // Is this board point over land? Tests the generated coastline polygons that
+  // worldLayer() renders, in the same board coordinate space the cities use.
+  let landPaths = null;
+  function overLand(x, y) {
+    if (!landPaths || !landPaths[0] || !landPaths[0].isConnected) {
+      landPaths = [...document.querySelectorAll('#map .world .land')];
+    }
+    const pt = $('#map').createSVGPoint();
+    pt.x = x; pt.y = y;
+    return landPaths.some(p => p.isPointInFill(pt));
+  }
+
+  const WRAP_EDGE = new Set(D.wrapEdges.map(([a, b]) => [a, b].sort().join('|')));
+
+  // Drive vs ferry: a route is a ferry when it wraps around the Pacific or a
+  // meaningful stretch of the straight line between the cities is open water.
+  function isFerryRoute(fromCity, toCity) {
+    if (WRAP_EDGE.has([fromCity, toCity].sort().join('|'))) return true;
+    const a = Game.CITY[fromCity], b = Game.CITY[toCity];
+    let water = 0;
+    for (let i = 1; i <= 7; i++) {
+      const t = i / 8;
+      if (!overLand(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)) water++;
+    }
+    return water >= 3;
+  }
+
+  // A little car putters down the road between adjacent cities (or a ferry
+  // chugs across the water), leaving brief tracks/wake. Pure flourish for
+  // drive/ferry moves; never touches game state.
+  function animateDrive(fromCity, toCity) {
+    const a = Game.CITY[fromCity], b = Game.CITY[toCity];
+    if (!a || !b || (a.x === b.x && a.y === b.y)) return;
+    const ferry = isFerryRoute(fromCity, toCity);
+    const map = $('#map');
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    const deg = Math.atan2(dy, dx) * 180 / Math.PI;
+    // mirror instead of rotating past vertical, so it never travels on its roof
+    const heading = dx < 0 ? `rotate(${deg - 180}) scale(-1,1)` : `rotate(${deg})`;
+
+    const road = svg('line', {
+      class: ferry ? 'drivetrail wake' : 'drivetrail',
+      x1: a.x, y1: a.y, x2: b.x, y2: b.y,
+    });
+    map.append(road);
+    const vehicle = svg('path', {
+      class: ferry ? 'boaticon' : 'caricon',
+      d: ferry ? BOAT_PATH : CAR_PATH,
+    });
+    map.append(vehicle);
+
+    const dur = Math.max(550, Math.min(1500, dist * 3.2));
+    const t0 = performance.now();
+    (function step(now) {
+      const t = Math.min(1, (now - t0) / dur);
+      // cars jitter on a bumpy road; boats ride a slow swell and roll a little
+      const bob = ferry ? Math.sin(t * Math.PI * 3) * 1.4 : Math.sin(t * Math.PI * 8) * 0.9;
+      const roll = ferry ? ` rotate(${Math.sin(t * Math.PI * 4) * 4})` : '';
+      vehicle.setAttribute('transform', `translate(${a.x + dx * t},${a.y + dy * t + bob}) ${heading}${roll}`);
+      if (t < 1 && vehicle.isConnected) requestAnimationFrame(step);
+      else {
+        vehicle.remove();
+        road.classList.add('fade');
+        setTimeout(() => road.remove(), 700);
+      }
+    })(t0);
+  }
+
   // Outbreak at a city: zoom in, shake, detonate, then send the disease down
   // each edge to its neighbors ONE BY ONE so the spread can be watched.
   // Returns the total duration so chained outbreaks can queue up after it.
@@ -1595,6 +1697,69 @@
     box.innerHTML = '';
   }
 
+  // ================= News ticker =================
+  // The storyline (log entries with cls 'news') scrolls across the bottom of
+  // the screen like a broadcast ticker: new headlines enter from the right as
+  // they happen, and the most recent ones stay in rotation.
+
+  const TICKER_KEEP = 6;    // headlines kept in rotation
+  const TICKER_SPEED = 80;  // px per second
+
+  const ticker = { seen: 0, items: [], ri: 0, x: null, last: 0, raf: 0 };
+
+  function tickerItem(msg) {
+    return el('span', { class: 'tickeritem' }, el('span', { class: 'tickersep' }, '✦'), msg);
+  }
+
+  function syncTicker() {
+    const bar = $('#ticker');
+    const g = G();
+    if (!g) { bar.hidden = true; return; }
+    bar.hidden = false;
+    const news = g.log.filter(e => e.cls === 'news').map(e => e.msg.replace(/^📰 /, ''));
+    if (news.length < ticker.seen) {
+      // New game, undo, or trimmed log: restart from what's there, replaying
+      // at most one rotation's worth so a fresh game shows its intro beats.
+      ticker.items = []; ticker.ri = 0; ticker.x = null; ticker.raf = 0;
+      $('#tickertrack').innerHTML = '';
+      ticker.seen = Math.max(0, news.length - TICKER_KEEP);
+    }
+    const track = $('#tickertrack');
+    for (const msg of news.slice(ticker.seen)) {
+      ticker.items.push(msg);
+      if (ticker.items.length > TICKER_KEEP) ticker.items.shift();
+      track.append(tickerItem(msg)); // enters from the right as it happens
+    }
+    ticker.seen = news.length;
+    if (track.children.length && !ticker.raf) {
+      if (ticker.x === null) ticker.x = $('#tickerwrap').clientWidth + 20;
+      ticker.last = performance.now();
+      ticker.raf = requestAnimationFrame(tickerStep);
+    }
+  }
+
+  function tickerStep(now) {
+    const track = $('#tickertrack');
+    const wrapW = $('#tickerwrap').clientWidth;
+    const dt = Math.min(0.1, (now - ticker.last) / 1000); // clamp background-tab gaps
+    ticker.last = now;
+    ticker.x -= TICKER_SPEED * dt;
+    // Drop headlines that have fully scrolled off the left edge.
+    while (track.firstElementChild) {
+      const w = track.firstElementChild.getBoundingClientRect().width;
+      if (ticker.x + w < -10) { track.firstElementChild.remove(); ticker.x += w; }
+      else break;
+    }
+    // Keep the stream continuous: when the tail nears the right edge, feed in
+    // the next headline from the rotation.
+    if (ticker.items.length && ticker.x + track.getBoundingClientRect().width < wrapW + 30) {
+      track.append(tickerItem(ticker.items[ticker.ri++ % ticker.items.length]));
+    }
+    track.style.transform = `translateX(${ticker.x}px)`;
+    if (track.children.length) ticker.raf = requestAnimationFrame(tickerStep);
+    else { ticker.raf = 0; ticker.x = null; }
+  }
+
   // ================= Main refresh =================
 
   function refresh() {
@@ -1614,6 +1779,7 @@
     renderPlayers();
     renderStatus();
     renderLog();
+    syncTicker();
     renderStateModal();
     save();
     // animate turn hand-offs
