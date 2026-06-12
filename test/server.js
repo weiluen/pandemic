@@ -329,6 +329,28 @@ async function main() {
     es2.close();
   });
 
+  // ---- persistence ----
+  await t('rooms persist to disk and reload', async () => {
+    srv.saveNow();
+    const onDisk = JSON.parse(require('fs').readFileSync(process.env.PANDEMIC_SAVE, 'utf8'));
+    assert.ok(onDisk.some(r => r.code === g2.code));
+    const live = srv.rooms.get(g2.code);
+    srv.rooms.clear();
+    srv.loadRooms();
+    const back = srv.rooms.get(g2.code);
+    assert.ok(back);
+    assert.equal(back.state, live.state);
+    assert.equal(back.seats[0].token, live.seats[0].token);
+    assert.deepEqual(back.sseClients, []);
+  });
+
+  await t('GC removes idle rooms', async () => {
+    const r = srv.rooms.get(g2.code);
+    r.lastActivity = Date.now() - 25 * 60 * 60 * 1000;
+    srv.gcRooms();
+    assert.ok(!srv.rooms.get(g2.code));
+  });
+
   server.close();
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

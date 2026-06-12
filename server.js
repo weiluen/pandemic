@@ -95,6 +95,7 @@ function broadcast(room, actorSeat) {
   for (const c of room.sseClients) {
     c.res.write(`data: ${JSON.stringify(payload(room, c.seat, actorSeat))}\n\n`);
   }
+  scheduleSave();
 }
 
 // SSE keepalive: comment frames every 25s so idle connections stay open.
@@ -103,6 +104,49 @@ setInterval(() => {
     for (const c of room.sseClients) c.res.write(': ping\n\n');
   }
 }, 25000).unref();
+
+// ---------------- persistence ----------------
+// Rooms (tokens included) survive a server restart; SSE clients reconnect on
+// their own (EventSource auto-retry) and re-authenticate by token.
+
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => { saveTimer = null; saveNow(); }, 500);
+}
+
+function saveNow() {
+  const data = [...rooms.values()].map(r => ({
+    ...r,
+    sseClients: undefined,
+    seats: r.seats.map(s => ({ ...s, connected: 0 })),
+  }));
+  try {
+    fs.mkdirSync(path.dirname(SAVE_FILE), { recursive: true });
+    fs.writeFileSync(SAVE_FILE, JSON.stringify(data));
+  } catch (e) {
+    console.error('save failed:', e.message);
+  }
+}
+
+function loadRooms() {
+  try {
+    for (const r of JSON.parse(fs.readFileSync(SAVE_FILE, 'utf8'))) {
+      r.sseClients = [];
+      rooms.set(r.code, r);
+    }
+  } catch (e) { /* first run: no save file yet */ }
+}
+
+function gcRooms() {
+  for (const [code, room] of rooms) {
+    if (Date.now() - room.lastActivity > ROOM_TTL) {
+      for (const c of room.sseClients) { try { c.res.end(); } catch (e) {} }
+      rooms.delete(code);
+    }
+  }
+  scheduleSave();
+}
 
 // ---------------- permissions & engine application ----------------
 
@@ -323,9 +367,12 @@ function createAppServer() {
 // ---------------- boot ----------------
 
 if (require.main === module) {
+  loadRooms();
   createAppServer().listen(PORT, () => {
     console.log(`Pandemic server: http://localhost:${PORT}`);
+    console.log(`Friends connect to your LAN address or tunnel on port ${PORT}.`);
   });
+  setInterval(gcRooms, 60 * 60 * 1000).unref();
 } else {
-  module.exports = { createAppServer, rooms, SAVE_FILE };
+  module.exports = { createAppServer, rooms, loadRooms, saveNow, gcRooms, SAVE_FILE };
 }
