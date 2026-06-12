@@ -97,6 +97,13 @@ function broadcast(room, actorSeat) {
   }
 }
 
+// SSE keepalive: comment frames every 25s so idle connections stay open.
+setInterval(() => {
+  for (const room of rooms.values()) {
+    for (const c of room.sseClients) c.res.write(': ping\n\n');
+  }
+}, 25000).unref();
+
 // ---------------- permissions & engine application ----------------
 
 // Mutating engine functions a client may invoke. Anything else is rejected.
@@ -265,6 +272,29 @@ async function apiRooms(req, res, url, code, sub) {
     touch(room);
     broadcast(room, seat);
     return sendJSON(res, 200, { ok: true, ret: out.ret, room: payload(room, seat, seat) });
+  }
+
+  if (sub === 'events' && req.method === 'GET') {
+    const seat = seatByToken(room, url.searchParams.get('token'));
+    if (seat < 0) return sendJSON(res, 403, { error: 'not a player in this room' });
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    const client = { res, seat };
+    room.sseClients.push(client);
+    room.seats[seat].connected++;
+    touch(room);
+    res.write(`retry: 1500\n\n`);
+    broadcast(room); // everyone (incl. this client) sees the fresh roster
+    req.on('close', () => {
+      room.sseClients = room.sseClients.filter(c => c !== client);
+      room.seats[seat].connected = Math.max(0, room.seats[seat].connected - 1);
+      broadcast(room);
+    });
+    return;
   }
 
   if (sub === 'undo' && req.method === 'POST') {

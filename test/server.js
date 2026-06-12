@@ -24,6 +24,37 @@ async function post(path, body) {
   return { status: r.status, body: await r.json().catch(() => ({})) };
 }
 
+// Minimal SSE client: opens the stream, exposes an async next() for events.
+function sseOpen(pathWithQuery) {
+  const queue = [], waiters = [];
+  let buf = '';
+  const req = http.get(base + pathWithQuery, res => {
+    res.setEncoding('utf8');
+    res.on('data', chunk => {
+      buf += chunk;
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+        const data = frame.split('\n').filter(l => l.startsWith('data: '))
+          .map(l => l.slice(6)).join('');
+        if (!data) continue;
+        const ev = JSON.parse(data);
+        if (waiters.length) waiters.shift()(ev); else queue.push(ev);
+      }
+    });
+  });
+  return {
+    next(timeoutMs = 2000) {
+      if (queue.length) return Promise.resolve(queue.shift());
+      return new Promise((resolve, reject) => {
+        const to = setTimeout(() => reject(new Error('SSE timeout')), timeoutMs);
+        waiters.push(ev => { clearTimeout(to); resolve(ev); });
+      });
+    },
+    close() { req.destroy(); },
+  };
+}
+
 async function main() {
   const server = srv.createAppServer();
   await new Promise(res => server.listen(0, '127.0.0.1', res));
@@ -253,6 +284,49 @@ async function main() {
     const c = await post('/api/rooms', { name: 'Solo' });
     const r = await post(`/api/rooms/${c.body.code}/action`, { token: c.body.token, fn: 'pass', args: [] });
     assert.equal(r.status, 409);
+  });
+
+  // ---- SSE ----
+  let g3;
+  await t('SSE: snapshot on connect, stamped with mySeat', async () => {
+    const c = await post('/api/rooms', { name: 'Alice' });
+    const j = await post(`/api/rooms/${c.body.code}/join`, { name: 'Bob' });
+    g3 = { code: c.body.code, alice: c.body.token, bob: j.body.token };
+    g3.es = sseOpen(`/api/rooms/${g3.code}/events?token=${g3.bob}`);
+    const ev = await g3.es.next();
+    assert.equal(ev.status, 'lobby');
+    assert.equal(ev.mySeat, 1);
+    assert.equal(ev.seats.length, 2);
+    assert.equal(ev.seats[1].connected, true);
+  });
+
+  await t('SSE: bad token is rejected', async () => {
+    const r = await fetch(base + `/api/rooms/${g3.code}/events?token=nope`);
+    assert.equal(r.status, 403);
+    r.body && r.body.cancel && r.body.cancel().catch(() => {});
+  });
+
+  await t('SSE: start and actions push state with rising seq', async () => {
+    await post(`/api/rooms/${g3.code}/start`, { token: g3.alice, epidemics: 4 });
+    const started = await g3.es.next();
+    assert.equal(started.status, 'playing');
+    assert.ok(started.state);
+    await post(`/api/rooms/${g3.code}/action`, { token: g3.alice, fn: 'pass', args: [] });
+    const acted = await g3.es.next();
+    assert.ok(acted.seq > started.seq);
+    assert.equal(acted.actorSeat, 0);
+    assert.equal(JSON.parse(acted.state).phase, 'draw');
+  });
+
+  await t('SSE: disconnect flips connected flag for others', async () => {
+    const es2 = sseOpen(`/api/rooms/${g3.code}/events?token=${g3.alice}`);
+    await es2.next();             // alice's hello
+    await g3.es.next();           // bob sees alice connect
+    g3.es.close();                // bob drops
+    let ev;
+    for (let i = 0; i < 3; i++) { ev = await es2.next(); if (ev.seats[1].connected === false) break; }
+    assert.equal(ev.seats[1].connected, false);
+    es2.close();
   });
 
   server.close();
