@@ -510,6 +510,15 @@
       class: 'stat statbtn', title: 'Click to inspect the infection discard pile',
       onclick: showInfectionPile,
     }, 'Infection deck', el('b', {}, ` ${g.infectionDeck.length}`), el('span', { class: 'peek' }, '🔍')));
+    if (Net.online) {
+      const offline = Net.seats.filter(s => !s.connected).map(s => s.name);
+      bar.append(el('span', {
+        class: 'stat',
+        title: Net.sseUp ? (offline.length ? `Disconnected: ${offline.join(', ')}` : 'Connected') : 'Reconnecting…',
+      }, `Room ${Net.code}`,
+        el('span', { class: 'connDot', style: `margin-left:6px;background:${Net.sseUp ? 'var(--good)' : 'var(--bad)'}` }),
+        offline.length ? el('span', { style: 'color:var(--bad);margin-left:6px' }, `⚠ ${offline.join(', ')}`) : null));
+    }
     bar.append(el('span', { class: 'spacer' }));
     bar.append(el('button', {
       title: muted ? 'Unmute sound effects' : 'Mute sound effects',
@@ -518,16 +527,22 @@
     bar.append(el('button', { onclick: showHelp }, 'Rules'));
     bar.append(el('button', {
       class: 'danger', onclick: () => {
-        openModal('Start a new game?', dlg => {
-          dlg.append(el('p', { class: 'sub' }, 'The current game will be abandoned.'));
+        openModal(Net.online ? 'Leave this game?' : 'Start a new game?', dlg => {
+          dlg.append(el('p', { class: 'sub' }, Net.online
+            ? 'You can rejoin with the room code as long as the game is running.'
+            : 'The current game will be abandoned.'));
           dlg.append(el('div', { class: 'btnrow' },
             el('button', { onclick: closeModal }, 'Cancel'),
             el('button', {
-              class: 'primary', onclick: () => { closeModal(); localStorage.removeItem(SAVE_KEY); $('#app').hidden = true; showSetup(); },
-            }, 'New game')));
+              class: 'primary', onclick: () => {
+                closeModal();
+                if (Net.online) { leaveOnline(); return; }
+                localStorage.removeItem(SAVE_KEY); $('#app').hidden = true; showSetup();
+              },
+            }, Net.online ? 'Leave Game' : 'New game')));
         });
       },
-    }, 'New Game'));
+    }, Net.online ? 'Leave Game' : 'New Game'));
   }
 
   // ================= Map view (zoom & pan) =================
@@ -1070,14 +1085,14 @@
         if (c.type === 'event') {
           hand.append(cardChip(c, {
             onPlay: () => playEventFlow(i, 'hand', c.event),
-            playDisabled: !Game.canPlayEvent(c.event),
+            playDisabled: !Game.canPlayEvent(c.event) || !mySeatIs(i),
           }));
         } else hand.append(cardChip(c));
       });
       if (p.role === 'Contingency Planner' && g.contingency) {
         hand.append(cardChip({ type: 'event', event: g.contingency }, {
           onPlay: () => playEventFlow(i, 'contingency', g.contingency),
-          playDisabled: !Game.canPlayEvent(g.contingency),
+          playDisabled: !Game.canPlayEvent(g.contingency) || !mySeatIs(i),
         }));
       }
       pc.append(hand);
@@ -1317,7 +1332,7 @@
     $('#mapwrap').querySelectorAll('.turnbanner').forEach(n => n.remove());
     const b = el('div', { class: 'turnbanner' },
       el('span', { class: 'rolechip', style: `background:${ROLE[me.role].color}` }, me.role),
-      el('span', {}, `${me.name}'s turn`));
+      el('span', {}, Net.online && Net.seat === g.current ? 'Your turn' : `${me.name}'s turn`));
     $('#mapwrap').append(b);
     sfx('turn');
     setTimeout(() => b.remove(), 2100);
@@ -1676,7 +1691,12 @@
       stats.append(el('div', { class: 'gostat' }, el('b', {}, `${COLORS.filter(c => g.cures[c]).length}/4`), 'cures found'));
       dlg.append(stats);
       dlg.append(el('div', { class: 'btnrow', style: 'justify-content:center' },
-        el('button', { class: 'primary', onclick: () => { localStorage.removeItem(SAVE_KEY); $('#app').hidden = true; showSetup(); } }, 'New Game')));
+        el('button', {
+          class: 'primary', onclick: () => {
+            if (Net.online) { leaveOnline(); return; }
+            localStorage.removeItem(SAVE_KEY); $('#app').hidden = true; showSetup();
+          },
+        }, Net.online ? 'Leave Room' : 'New Game')));
       box.append(dlg);
       if (g.result.win) {
         const palette = [HEX.blue, HEX.yellow, HEX.red, '#4ade80', '#f8fafc'];
@@ -1694,6 +1714,17 @@
 
     if (g.forecastPending) {
       box.hidden = false;
+      if (Net.online && Net.forecastBy !== Net.seat) {
+        const who = Net.forecastBy != null ? g.players[Net.forecastBy].name : 'Another player';
+        const dlg = el('div', { class: 'dialog' });
+        dlg.append(el('h2', {}, '🔮 Forecast'));
+        dlg.append(el('p', { class: 'sub' }, `${who} is rearranging the top of the infection deck…`));
+        const row = el('div', { class: 'handpick' });
+        g.forecastPending.forEach(c => row.append(cardChip({ type: 'city', city: c.city, color: c.color })));
+        dlg.append(row);
+        box.append(dlg);
+        return;
+      }
       if (!ui.forecastOrder || ui.forecastOrder.length !== g.forecastPending.length) {
         ui.forecastOrder = g.forecastPending.map((_, i) => i);
       }
@@ -1760,13 +1791,18 @@
       });
       const btns = el('div', { class: 'btnrow' });
       for (const h of rpHolders) {
+        if (!mySeatIs(h.i)) continue;
         btns.append(el('button', {
           onclick: () => playEventFlow(h.i, h.source, 'Resilient Population'),
         }, `${g.players[h.i].name}: play Resilient Population now`));
       }
-      btns.append(el('button', {
-        class: 'primary', onclick: async () => { if ((await run('intensify', [])).ok) sfx('draw'); },
-      }, 'Intensify (shuffle discard on top)'));
+      if (myTurn()) {
+        btns.append(el('button', {
+          class: 'primary', onclick: async () => { if ((await run('intensify', [])).ok) sfx('draw'); },
+        }, 'Intensify (shuffle discard on top)'));
+      } else {
+        btns.append(el('span', { class: 'sub' }, `Waiting for ${g.players[g.current].name} to intensify…`));
+      }
       dlg.append(btns);
       box.append(dlg);
       return;
@@ -1777,6 +1813,13 @@
       box.classList.add('docked'); // map stays visible & pannable behind this one
       const pi = g.discardQueue[0];
       const p = g.players[pi];
+      if (Net.online && pi !== Net.seat) {
+        const dlg = el('div', { class: 'dialog' });
+        dlg.append(el('h2', {}, `${p.name}: hand limit exceeded`));
+        dlg.append(el('p', { class: 'sub' }, `Waiting for ${p.name} to discard down to ${Game.HAND_LIMIT} cards…`));
+        box.append(dlg);
+        return;
+      }
       const dlg = el('div', { class: 'dialog' });
       dlg.append(el('h2', {}, `${p.name}: hand limit exceeded`));
       dlg.append(el('p', { class: 'sub' }, `Discard down to ${Game.HAND_LIMIT} cards (${p.hand.length} in hand). Click a card to discard it — or play an event instead. You can still pan and zoom the map behind this panel.`));
