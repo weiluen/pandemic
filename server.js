@@ -29,6 +29,52 @@ const MIME = {
 
 const rooms = new Map(); // code -> room
 
+// ---------------- rooms ----------------
+
+function newToken() { return crypto.randomBytes(16).toString('hex'); }
+
+function newRoomCode() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; // no I/O — avoids misreads over voice chat
+  for (;;) {
+    let c = '';
+    for (let i = 0; i < 4; i++) c += A[crypto.randomInt(A.length)];
+    if (!rooms.has(c)) return c;
+  }
+}
+
+function seatName(given, idx) {
+  return (given || '').trim().slice(0, 24) || `Player ${idx + 1}`;
+}
+
+function seatByToken(room, token) {
+  return room.seats.findIndex(s => token && s.token === token);
+}
+
+function createRoom(body) {
+  const room = {
+    code: newRoomCode(),
+    status: 'lobby',            // lobby | playing | over
+    seats: [],                  // [{name, token, connected}] — index = engine player index
+    hostToken: null,
+    state: null,                // JSON string of engine G
+    turnSnapshots: [],          // pre-action snapshots for undo, cleared on turn change
+    forecastBy: null,           // seat that played Forecast, may commit it
+    seq: 0,
+    sseClients: [],             // [{res, seat}]
+    lastActivity: Date.now(),
+  };
+  const token = newToken();
+  room.seats.push({ name: seatName(body.name, 0), token, connected: 0 });
+  room.hostToken = token;
+  rooms.set(room.code, room);
+  return { room, token };
+}
+
+function touch(room) { room.lastActivity = Date.now(); }
+
+// Placeholder until SSE lands: roster/state changed, notify clients.
+function broadcast(room) { room.seq++; }
+
 // ---------------- helpers ----------------
 
 function sendJSON(res, status, obj) {
@@ -81,12 +127,42 @@ async function handle(req, res) {
   const p = url.pathname;
   try {
     if (p === '/api/ping') return sendJSON(res, 200, { ok: true });
+    const m = p.match(/^\/api\/rooms(?:\/([A-Z]{4})\/(\w+))?$/);
+    if (m) return apiRooms(req, res, url, m[1], m[2]);
     if (p.startsWith('/api/')) return sendJSON(res, 404, { error: 'unknown api route' });
     if (req.method === 'GET' || req.method === 'HEAD') return serveStatic(req, res, p);
     res.writeHead(405); res.end();
   } catch (e) {
     sendJSON(res, 500, { error: e.message });
   }
+}
+
+async function apiRooms(req, res, url, code, sub) {
+  // POST /api/rooms — create
+  if (!code) {
+    if (req.method !== 'POST') return sendJSON(res, 405, { error: 'POST required' });
+    const body = await readBody(req);
+    const { room, token } = createRoom(body);
+    touch(room);
+    return sendJSON(res, 200, { code: room.code, token, seat: 0 });
+  }
+  const room = rooms.get(code);
+  if (!room) return sendJSON(res, 404, { error: 'no such room' });
+
+  if (sub === 'join' && req.method === 'POST') {
+    const body = await readBody(req);
+    const rejoin = seatByToken(room, body.token);
+    if (rejoin >= 0) { touch(room); return sendJSON(res, 200, { token: room.seats[rejoin].token, seat: rejoin }); }
+    if (room.status !== 'lobby') return sendJSON(res, 409, { error: 'game already started' });
+    if (room.seats.length >= MAX_SEATS) return sendJSON(res, 409, { error: 'room is full' });
+    const token = newToken();
+    room.seats.push({ name: seatName(body.name, room.seats.length), token, connected: 0 });
+    touch(room);
+    broadcast(room);
+    return sendJSON(res, 200, { token, seat: room.seats.length - 1 });
+  }
+
+  return sendJSON(res, 404, { error: 'unknown api route' });
 }
 
 function createAppServer() {

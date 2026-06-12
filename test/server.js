@@ -73,6 +73,49 @@ async function main() {
     assert.ok(status === 404 || status === 400, `got ${status}`);
   });
 
+  // ---- rooms: create / join / rejoin ----
+  let room; // {code, token, seat}
+
+  await t('create room', async () => {
+    const r = await post('/api/rooms', { name: 'Alice' });
+    assert.equal(r.status, 200);
+    assert.match(r.body.code, /^[A-Z]{4}$/);
+    assert.ok(r.body.token.length >= 16);
+    assert.equal(r.body.seat, 0);
+    room = r.body;
+  });
+
+  await t('join room', async () => {
+    const r = await post(`/api/rooms/${room.code}/join`, { name: 'Bob' });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.seat, 1);
+    room.bob = r.body.token;
+  });
+
+  await t('join unknown room is 404', async () => {
+    const r = await post('/api/rooms/ZZZZ/join', { name: 'Eve' });
+    assert.equal(r.status, 404);
+  });
+
+  await t('rejoin by token returns same seat, no new seat', async () => {
+    const r = await post(`/api/rooms/${room.code}/join`, { token: room.bob });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.seat, 1);
+    assert.equal(srv.rooms.get(room.code).seats.length, 2);
+  });
+
+  await t('room is full after 4 seats', async () => {
+    await post(`/api/rooms/${room.code}/join`, { name: 'Cara' });
+    await post(`/api/rooms/${room.code}/join`, { name: 'Dan' });
+    const r = await post(`/api/rooms/${room.code}/join`, { name: 'Eve' });
+    assert.equal(r.status, 409);
+  });
+
+  await t('name defaults when blank', async () => {
+    const r2 = await post('/api/rooms', {});
+    assert.equal(srv.rooms.get(r2.body.code).seats[0].name, 'Player 1');
+  });
+
   server.close();
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
