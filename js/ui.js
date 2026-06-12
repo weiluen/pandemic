@@ -43,6 +43,9 @@
 
   const $ = s => document.querySelector(s);
   const G = () => Game.state();
+  // Online: you are exactly one seat. Local hotseat: you are whoever's turn it is.
+  const myTurn = () => !Net.online || Net.seat === G().current;
+  const mySeatIs = i => !Net.online || Net.seat === i;
 
   function el(tag, attrs, ...kids) {
     const n = document.createElement(tag);
@@ -248,9 +251,15 @@
     function renderPlayerRows() {
       nameInputs.innerHTML = ''; roleSelects.innerHTML = '';
       for (let i = 0; i < count; i++) {
+        const ctrl = el('select', { id: `pctrl${i}`, style: 'margin-left:6px' },
+          el('option', { value: '' }, '👤 Human'),
+          el('option', { value: 'novice' }, '🤖 AI — Novice'),
+          el('option', { value: 'competent' }, '🤖 AI — Competent'),
+          el('option', { value: 'expert' }, '🤖 AI — Expert'));
         nameInputs.append(el('div', { class: 'setuprow' },
           el('label', {}, `Player ${i + 1} name`),
-          el('input', { type: 'text', id: `pname${i}`, value: `Player ${i + 1}` })));
+          el('input', { type: 'text', id: `pname${i}`, value: `Player ${i + 1}` }),
+          ctrl));
         const sel = el('select', { id: `prole${i}` }, el('option', { value: '' }, 'Random role'));
         for (const r of D.roles) sel.append(el('option', { value: r.name }, r.name));
         const desc = el('div', { class: 'setupdesc' });
@@ -294,10 +303,15 @@
           class: 'primary', onclick: () => {
             showErr('');
             try {
-              const names = [], roles = [];
+              const names = [], roles = [], ais = [];
               for (let i = 0; i < count; i++) {
-                names.push($(`#pname${i}`).value.trim() || `Player ${i + 1}`);
+                const ai = $(`#pctrl${i}`).value || null;
+                const fallback = ai ? `Bot ${i + 1}` : `Player ${i + 1}`;
+                let nm = $(`#pname${i}`).value.trim() || fallback;
+                if (ai && nm === `Player ${i + 1}`) nm = fallback; // untouched default → bot name
+                names.push(nm);
                 roles.push($(`#prole${i}`).value);
+                ais.push(ai);
               }
               const chosen = roles.filter(Boolean);
               if (new Set(chosen).size !== chosen.length) {
@@ -310,7 +324,7 @@
                 for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
                 for (let i = 0; i < count; i++) if (!roles[i]) roles[i] = pool.pop();
               }
-              Game.newGame({ names, epidemics: +epiSel.value, roles: chosen.length ? roles : null });
+              Game.newGame({ names, epidemics: +epiSel.value, roles: chosen.length ? roles : null, ais });
               ui.undoStack = [];
               ui.resultPlayed = false;
               ui.turnKey = null;
@@ -788,7 +802,7 @@
 
   function onCityClick(name, ev) {
     if (ui.selectMode) { const m = ui.selectMode; ui.selectMode = null; m.onPick(name); return; }
-    if (G().phase !== 'actions' || G().result) return;
+    if (G().phase !== 'actions' || G().result || !myTurn()) return;
     const rect = $('#mapwrap').getBoundingClientRect();
     ui.lastCityClick = { px: ev.clientX - rect.left, py: ev.clientY - rect.top };
     ui.selectedCity = ui.selectedCity === name ? null : name;
@@ -800,7 +814,7 @@
     const g = G();
     const menu = $('#citymenu');
     const name = ui.selectedCity;
-    if (!name || g.phase !== 'actions' || g.result) { menu.hidden = true; return; }
+    if (!name || g.phase !== 'actions' || g.result || !myTurn()) { menu.hidden = true; return; }
     menu.hidden = false;
     menu.innerHTML = '';
     const city = Game.CITY[name];
@@ -912,6 +926,18 @@
     box.append(grid);
     const me = g.players[g.current];
 
+    if (Net.online && !myTurn() && ['actions', 'draw', 'infect', 'epidemicPause'].includes(g.phase)) {
+      grid.append(el('div', { class: 'wide', style: 'grid-column:1/-1;font-size:13px;color:var(--dim)' },
+        `⏳ Waiting for ${me.name} (${me.role})…`));
+      return;
+    }
+
+    if (me.ai && !g.result) {
+      grid.append(el('div', { class: 'wide', style: 'grid-column:1/-1;font-size:13px;color:var(--dim)' },
+        `🤖 ${me.name} (${me.role}, ${me.ai} AI) is thinking…`));
+      return;
+    }
+
     if (g.phase === 'actions') {
       const cubesHere = COLORS.filter(c => g.cityCubes[me.location][c] > 0);
       grid.append(el('button', { disabled: !cubesHere.length, onclick: () => doTreat(cubesHere) }, 'Treat Disease'));
@@ -932,8 +958,15 @@
         class: 'wide', onclick: async () => { if ((await act('pass', [])).ok) sfx('click'); },
       }, `End Actions (forfeit ${g.actionsLeft})`));
       grid.append(el('button', {
-        class: 'wide', disabled: !ui.undoStack.length,
-        onclick: () => { Game.restore(ui.undoStack.pop()); ui.selectedCity = null; sfx('click'); refresh(); },
+        class: 'wide', disabled: Net.online ? !Net.undoDepth : !ui.undoStack.length,
+        onclick: async () => {
+          if (Net.online) {
+            try { const j = await Net.undo(); Net.applyPayload(j.room); refresh(); sfx('click'); }
+            catch (e) { toast(e.message); sfx('error'); }
+          } else {
+            Game.restore(ui.undoStack.pop()); ui.selectedCity = null; sfx('click'); refresh();
+          }
+        },
       }, '↩ Undo Action'));
     } else if (g.phase === 'draw') {
       const drawn = g.lastDrawn.filter(c => c.type !== 'epidemic');
@@ -1868,6 +1901,44 @@
     else { ticker.raf = 0; ticker.x = null; }
   }
 
+  // ================= AI turns =================
+  // When the current player is an AI, advance the game one engine call at a
+  // time on a timer, so humans can watch the bot think. Local games only —
+  // online rooms are driven by the server.
+
+  let aiTimer = null;
+
+  function aiDue() {
+    const g = G();
+    if (!g || g.result || (globalThis.Net && Net.online) || !globalThis.AI) return false;
+    if (g.forecastPending) return !!g.players[g.current].ai;
+    if (g.phase === 'discard') return !!g.players[g.discardQueue[0]] && !!g.players[g.discardQueue[0]].ai;
+    return !!g.players[g.current].ai;
+  }
+
+  function scheduleAI() {
+    if (aiTimer || !aiDue()) return;
+    aiTimer = setTimeout(() => {
+      aiTimer = null;
+      if (!aiDue()) return;
+      const g = G();
+      try {
+        const logMark = g.log.length;
+        const did = AI.step(g.players[g.current].ai || g.players[g.discardQueue[0]].ai);
+        if (did) {
+          animateOutbreaks(logMark);
+          sfx('click');
+        } else if (g.phase === 'actions' && !g.result) {
+          Game.pass(); // never let a stuck bot freeze the table
+        }
+      } catch (e) {
+        console.error('AI step failed:', e);
+        try { if (G().phase === 'actions') Game.pass(); } catch (e2) { /* leave it to the next tick */ }
+      }
+      refresh(); // re-schedules if the AI still has work to do
+    }, 700);
+  }
+
   // ================= Main refresh =================
 
   function refresh() {
@@ -1890,6 +1961,7 @@
     syncTicker();
     renderStateModal();
     save();
+    scheduleAI();
     // animate turn hand-offs
     const key = `${g.turn}:${g.current}`;
     if (ui.turnKey !== key && g.phase === 'actions' && !g.result) {

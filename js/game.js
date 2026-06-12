@@ -215,6 +215,7 @@
     G = {
       players: cfg.names.map((name, i) => ({
         name: name || `Player ${i + 1}`, role: roleNames[i], location: START_CITY, hand: [],
+        ai: (cfg.ais && cfg.ais[i]) || null, // null = human; otherwise an AI skill level
       })),
       current: 0,
       turn: 1,
