@@ -2024,8 +2024,26 @@
     if (p && p.state && prevLogLen >= 0 && p.actorSeat !== Net.seat) animateRemote(prevLogLen);
   };
 
-  // Replaced in the remote-animations step with a log-diff replayer.
-  function animateRemote(logMark) {}
+  // Replay the visual beats of someone else's action from the log entries the
+  // new state added. Pure flavor — never touches game state. The 25-entry cap
+  // skips bulk catch-ups (fresh joins, reconnects after a long gap).
+  function animateRemote(logMark) {
+    const entries = G().log.slice(logMark);
+    if (!entries.length || entries.length > 25) return;
+    let infected = false, epidemic = false;
+    for (const e of entries) {
+      let m;
+      if ((m = e.msg.match(/^Epidemic strikes (.+)\.$/))) { epidemic = true; epicenter(m[1]); }
+      else if ((m = e.msg.match(/^(.+?) infected \((blue|yellow|black|red):/))) { infected = true; cityPulse(m[1], HEX[m[2]]); }
+      else if ((m = e.msg.match(/ moves(?: .+?)? to (.+?) \((drive|shuttle|direct|charter|dispatch|opex)\)\.$/))) { cityPulse(m[1], '#38bdf8'); }
+      else if ((m = e.msg.match(/^Airlift: .+? flies to (.+?)\.$/))) { cityPulse(m[1], '#4ade80'); }
+      else if ((m = e.msg.match(/discovers a CURE for the (blue|yellow|black|red) disease/))) { sfx('cure'); cureBanner(m[1]); }
+    }
+    if (epidemic) sfx('epidemic');
+    else if (entries.some(e => /^OUTBREAK/.test(e.msg))) { /* outbreakBlast plays its own sfx */ }
+    else if (infected) sfx('infect');
+    animateOutbreaks(logMark); // chains outbreak blasts exactly like local play
+  }
 
   // ================= Boot =================
 
