@@ -57,6 +57,14 @@
     'WORLD — The endgame. Officials declare the crisis "basically under control" for the fourth time, the colloidal-silver believers have all turned a permanent shade of blue, and everyone, everywhere, is still arguing about masks.',
   ];
 
+  // Other fully-fixed lines, named so the emit sites and narrationManifest()
+  // share one source of truth (and one voiceover clip each).
+  const OPEN_INTRO = 'GENEVA — The WHO convenes an emergency panel to decide what the four new pathogens must NOT be called. After six weeks it rules out every place, person, animal, and food, settling on names guaranteed not to alarm anyone or hurt tourism.';
+  const OPEN_STRAINS = `${STRAIN.blue.name} stirs ${STRAIN.blue.region}; ${STRAIN.yellow.name} spreads ${STRAIN.yellow.region}; ${STRAIN.black.name} takes hold ${STRAIN.black.region}; ${STRAIN.red.name} surges ${STRAIN.red.region}. Officials advise that there is no need to cancel anything, probably.`;
+  const MILESTONE_HALF = 'World leaders convene an emergency summit as the outbreak tally hits four. They emerge to announce the formation of a committee to schedule a future summit.';
+  const MILESTONE_BRINK = 'Six outbreaks and counting. Society teeters — two more and there is no coming back. Officials respond by installing more plexiglass and a touchless mustard dispenser.';
+  const WIN_NEWS = 'THE WORLD EXHALES — every disease cured, the pandemic declared over. Survivors mark the occasion in the time-honored way: by panic-buying toilet paper, just in case.';
+
   // Periodic "situation reports": comic wire copy that splices in the LIVE
   // numbers (cases, infected cities, outbreaks, infection rate, cures), so the
   // ticker keeps narrating the actual evolving state, not a canned script.
@@ -111,9 +119,42 @@
   }
 
   // A world-news bulletin in the log: storyline flavor, no mechanical effect.
-  function narrate(msg) {
-    G.log.push({ msg: '📰 ' + msg, cls: 'news', turn: G.turn });
+  // `audio`, when present, is the stable clip id (see narrationManifest) the UI
+  // uses to play a pre-generated voiceover for this fixed line.
+  function narrate(msg, audio) {
+    const entry = { msg: '📰 ' + msg, cls: 'news', turn: G.turn };
+    if (audio) entry.audio = audio;
+    G.log.push(entry);
     if (G.log.length > 500) G.log.splice(0, G.log.length - 500);
+  }
+
+  // Sanitize a logical clip id (e.g. "crisis:Sao Paulo") into a filesystem- and
+  // URL-safe basename ("crisis_Sao_Paulo"). Shared scheme between the engine
+  // (which tags beats), narrationManifest(), and the generation script.
+  function clipId(s) { return s.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, ''); }
+
+  // The full set of fully-fixed narration lines that get a pre-generated
+  // voiceover, as { id, text }. This is the single source of truth for the
+  // generation script (tools/generate-narration.mjs); the ids match the `audio`
+  // tags attached to log entries above. Dynamic lines (situation reports, the
+  // hot-zone opening, strain-interpolated cure/eradication/fallbacks) are
+  // intentionally excluded — the UI voices those with the built-in synthesizer.
+  function narrationManifest() {
+    const out = [];
+    for (const c of D.cities) {
+      const lore = (D.cityLore && D.cityLore[c.name]) || {};
+      if (lore.reach) out.push({ id: clipId('reach:' + c.name), text: lore.reach });
+      if (lore.crisis) out.push({ id: clipId('crisis:' + c.name), text: lore.crisis });
+    }
+    for (let i = 1; i < STAGE_NEWS.length; i++) {
+      if (STAGE_NEWS[i]) out.push({ id: 'stage_' + i, text: STAGE_NEWS[i] });
+    }
+    out.push({ id: 'milestone_half', text: MILESTONE_HALF });
+    out.push({ id: 'milestone_brink', text: MILESTONE_BRINK });
+    out.push({ id: 'win', text: WIN_NEWS });
+    out.push({ id: 'open_0', text: OPEN_INTRO });
+    out.push({ id: 'open_1', text: OPEN_STRAINS });
+    return out;
   }
 
   // Narration counters, lazily created so saves written before the storyline
@@ -134,8 +175,8 @@
   // Emit a news beat. The message is built inside a try/catch because narration
   // is pure decoration — a bug here must NEVER interrupt the rules engine
   // (an unhandled throw mid-epidemic/outbreak would skip infection steps).
-  function newsBeat(build) {
-    try { const msg = build(); if (msg) narrate(msg); } catch (e) { /* flavor only */ }
+  function newsBeat(build, audio) {
+    try { const msg = build(); if (msg) narrate(msg, audio); } catch (e) { /* flavor only */ }
   }
 
   // Deterministic rotation through a template list so repeated beats vary
@@ -147,12 +188,16 @@
   // `tail`, if given, appends a live state-derived clause so the same bespoke
   // line still reflects the evolving game (rising rate, outbreak tally, …).
   function cityBeat(city, kind, fallback, tail) {
+    const lore = D.cityLore && D.cityLore[city];
+    const hasLore = !!(lore && lore[kind]);
+    // Only tag audio when the bespoke (fixed) line is used; the optional numeric
+    // tail isn't voiced, and generic fallbacks are dynamic so they get no clip.
+    const audio = hasLore ? clipId(kind + ':' + city) : undefined;
     newsBeat(() => {
-      const lore = D.cityLore && D.cityLore[city];
-      let line = (lore && lore[kind]) || (fallback ? fallback() : null);
+      let line = hasLore ? lore[kind] : (fallback ? fallback() : null);
       if (line && tail) { const t = tail(); if (t) line += ' ' + t; }
       return line;
-    });
+    }, audio);
   }
 
   // Live board snapshot for state-driven bulletins.
@@ -194,7 +239,7 @@
     while (s.stage < now) {
       s.stage++;
       const msg = STAGE_NEWS[s.stage];
-      if (msg) newsBeat(() => msg);
+      if (msg) newsBeat(() => msg, 'stage_' + s.stage);
     }
   }
 
@@ -282,8 +327,8 @@
       log(`${card.city} starts with ${count} ${card.color} cube${count > 1 ? 's' : ''}.`);
     }
     log(`Research station built in ${START_CITY}. All pawns start there.`);
-    narrate('GENEVA — The WHO convenes an emergency panel to decide what the four new pathogens must NOT be called. After six weeks it rules out every place, person, animal, and food, settling on names guaranteed not to alarm anyone or hurt tourism.');
-    narrate(`${STRAIN.blue.name} stirs ${STRAIN.blue.region}; ${STRAIN.yellow.name} spreads ${STRAIN.yellow.region}; ${STRAIN.black.name} takes hold ${STRAIN.black.region}; ${STRAIN.red.name} surges ${STRAIN.red.region}. Officials advise that there is no need to cancel anything, probably.`);
+    narrate(OPEN_INTRO, 'open_0');
+    narrate(OPEN_STRAINS, 'open_1');
     narrate(`A field team mobilizes from CDC Atlanta. The earliest hot zones — ${hotZones.join(', ')} — are already past saving, yet markets shrug and a cable-news chyron asks whether the whole thing might just be a bad flu.`);
     log(`${G.players[0].name}'s turn begins.`, 'good');
     return G;
@@ -350,8 +395,9 @@
     G.phase = 'over';
     log(win ? `VICTORY — ${reason}` : `DEFEAT — ${reason}`, win ? 'good' : 'bad');
     newsBeat(() => win
-      ? 'THE WORLD EXHALES — every disease cured, the pandemic declared over. Survivors mark the occasion in the time-honored way: by panic-buying toilet paper, just in case.'
-      : `SILENCE FALLS — ${reason}. The final press release declares the situation "basically under control," then there is no one left to read it.`);
+      ? WIN_NEWS
+      : `SILENCE FALLS — ${reason}. The final press release declares the situation "basically under control," then there is no one left to read it.`,
+      win ? 'win' : undefined);
   }
 
   function removeCubes(city, color, count) {
@@ -390,13 +436,13 @@
     if (G.outbreaks === 4) newsBeat(() => {
       if (story().milestones.half) return null;
       story().milestones.half = true;
-      return 'World leaders convene an emergency summit as the outbreak tally hits four. They emerge to announce the formation of a committee to schedule a future summit.';
-    });
+      return MILESTONE_HALF;
+    }, 'milestone_half');
     if (G.outbreaks === 6) newsBeat(() => {
       if (story().milestones.brink) return null;
       story().milestones.brink = true;
-      return 'Six outbreaks and counting. Society teeters — two more and there is no coming back. Officials respond by installing more plexiglass and a touchless mustard dispenser.';
-    });
+      return MILESTONE_BRINK;
+    }, 'milestone_brink');
     checkWorldStage();
     if (G.outbreaks >= MAX_OUTBREAKS) {
       gameOver(false, 'worldwide panic — the 8th outbreak occurred');
@@ -927,5 +973,6 @@
     drawPlayerCard, intensify, flipInfectionCard, discardForLimit,
     canPlayEvent, playEvent, forecastCommit,
     serialize, load, snapshot, restore, validate,
+    narrationManifest,
   };
 })();
