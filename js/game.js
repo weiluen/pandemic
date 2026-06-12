@@ -875,6 +875,48 @@
   function snapshot() { return JSON.stringify(G); }
   function restore(snap) { G = migrate(JSON.parse(snap)); }
 
+  // Integrity census of a (parsed) game state. A healthy state has every city
+  // card exactly once, every event at most once, 48 infection cards, and 24
+  // cubes per color between board and supply. Catches saves corrupted by
+  // historical bugs (e.g. mismatched scripts during live dev) before they are
+  // resumed and played on.
+  function validate(g) {
+    const problems = [];
+    try {
+      const zones = [g.playerDeck, g.playerDiscard, ...g.players.map(p => p.hand)];
+      const count = {};
+      for (const z of zones) for (const c of z) {
+        if (c.type === 'city') count[c.city] = (count[c.city] || 0) + 1;
+        else if (c.type === 'event') count['e:' + c.event] = (count['e:' + c.event] || 0) + 1;
+      }
+      for (const c of (g.removed || [])) {
+        if (c.type === 'city') count[c.city] = (count[c.city] || 0) + 1;
+        else if (c.type === 'event') count['e:' + c.event] = (count['e:' + c.event] || 0) + 1;
+      }
+      if (g.contingency) count['e:' + g.contingency] = (count['e:' + g.contingency] || 0) + 1;
+      for (const c of D.cities) {
+        const n = count[c.name] || 0;
+        if (n !== 1) problems.push(`${c.name} city card appears ${n} times`);
+      }
+      for (const e of D.events) {
+        if ((count['e:' + e.name] || 0) > 1) problems.push(`${e.name} event appears ${count['e:' + e.name]} times`);
+      }
+      const inf = [...g.infectionDeck, ...g.infectionDiscard,
+        ...(g.removed || []).filter(c => !c.type), ...(g.forecastPending || [])];
+      if (inf.length !== D.cities.length) problems.push(`${inf.length} infection cards (expected ${D.cities.length})`);
+      for (const color of COLORS) {
+        let onBoard = 0;
+        for (const c of D.cities) onBoard += g.cityCubes[c.name][color];
+        if (onBoard + g.cubeSupply[color] !== CUBES_PER_COLOR) {
+          problems.push(`${color} cubes: ${onBoard} on board + ${g.cubeSupply[color]} in supply ≠ ${CUBES_PER_COLOR}`);
+        }
+      }
+    } catch (e) {
+      problems.push('unreadable state: ' + e.message);
+    }
+    return { ok: problems.length === 0, problems };
+  }
+
   globalThis.Game = {
     COLORS, INFECTION_RATES, HAND_LIMIT, MAX_STATIONS, CUBES_PER_COLOR, MAX_OUTBREAKS,
     CITY, ADJ,
@@ -883,6 +925,6 @@
     performMove, treat, build, discoverCure, shareKnowledge, pass, contingencyTake,
     drawPlayerCard, intensify, flipInfectionCard, discardForLimit,
     canPlayEvent, playEvent, forecastCommit,
-    serialize, load, snapshot, restore,
+    serialize, load, snapshot, restore, validate,
   };
 })();
