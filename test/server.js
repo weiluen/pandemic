@@ -385,6 +385,16 @@ async function main() {
     es.close();
   });
 
+  // ---- deploy version stamp ----
+  await t('payloads carry the server boot id', async () => {
+    const c = await post('/api/rooms', { name: 'Solo' });
+    const es = sseOpen(`/api/rooms/${c.body.code}/events?token=${c.body.token}`);
+    const ev = await es.next();
+    assert.ok(ev.v, 'hello frame has v');
+    assert.equal(ev.v, srv.BOOT_ID);
+    es.close();
+  });
+
   // ---- persistence ----
   await t('rooms persist to disk and reload', async () => {
     srv.saveNow();

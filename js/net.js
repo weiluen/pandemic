@@ -96,6 +96,12 @@
   // of the same action can race safely.
   Net.applyPayload = function (p) {
     if (!Net.online) return;
+    // The server redeployed since this page loaded: reload to pick up matching
+    // client code. Harmless — the session in localStorage rejoins the seat.
+    if (p.v) {
+      if (Net.serverV == null) Net.serverV = p.v;
+      else if (p.v !== Net.serverV) { location.reload(); return; }
+    }
     // hello = authoritative resync after (re)connect: accept it even if the
     // server's seq went backwards (e.g. restored from a save after a restart).
     if (p.hello) Net.seq = p.seq - 1;

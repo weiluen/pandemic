@@ -29,6 +29,11 @@ const MIME = {
 
 const rooms = new Map(); // code -> room
 
+// Changes every boot (so every deploy). Clients compare it across payloads and
+// reload themselves when it moves — otherwise a page opened before a deploy
+// would run old JS against the new server forever.
+const BOOT_ID = `${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
+
 // ---------------- rooms ----------------
 
 function newToken() { return crypto.randomBytes(16).toString('hex'); }
@@ -78,6 +83,7 @@ function touch(room) { room.lastActivity = Date.now(); }
 // animations it already played locally).
 function payload(room, seat, actorSeat) {
   return {
+    v: BOOT_ID,
     seq: room.seq,
     code: room.code,
     status: room.status,
@@ -438,5 +444,5 @@ if (require.main === module) {
     process.on(sig, () => { saveNow(); process.exit(0); });
   }
 } else {
-  module.exports = { createAppServer, rooms, loadRooms, saveNow, gcRooms, SAVE_FILE };
+  module.exports = { createAppServer, rooms, loadRooms, saveNow, gcRooms, SAVE_FILE, BOOT_ID };
 }
