@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pandemic — Local Two-Player</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app" hidden>
+  <header id="topbar"></header>
+  <main>
+    <div id="mapwrap">
+      <svg id="map" viewBox="0 0 1500 780" preserveAspectRatio="xMidYMid meet"></svg>
+      <div id="citymenu" hidden></div>
+      <div id="banner" hidden></div>
+      <div id="mapcontrols">
+        <button id="zoomin" title="Zoom in">+</button>
+        <button id="zoomout" title="Zoom out">−</button>
+        <button id="zoomreset" title="Reset view">⊙</button>
+      </div>
+    </div>
+    <aside id="side">
+      <div id="turnbox"></div>
+      <div id="actionsbox"></div>
+      <div id="playersbox"></div>
+      <div id="statusbox"></div>
+      <div id="logbox"><div class="boxtitle">Log</div><div id="log"></div></div>
+    </aside>
+  </main>
+</div>
+<div id="setup" hidden></div>
+<div id="stateModal" hidden></div>
+<div id="modal" hidden></div>
+<div id="toast" hidden></div>
+<script src="js/worldmap.js"></script>
+<script src="js/data.js"></script>
+<script src="js/game.js"></script>
+<script>
+// Guard against a stale or partially-loaded page (e.g. cached 404s).
+if (!globalThis.Game || !globalThis.PANDEMIC_DATA) {
+  document.body.innerHTML = '<div style="color:#f87171;font:16px sans-serif;padding:40px">' +
+    'Game scripts failed to load. Hard-refresh this page (Cmd+Shift+R) or restart the server.</div>';
+  throw new Error('scripts missing');
+}
+</script>
+<script src="js/ui.js"></script>
+<script>
+// Dev live-reload: poll source files and refresh when they change (localhost only).
+// Safe mid-game: state autosaves after every action and auto-resumes on load.
+if (['localhost', '127.0.0.1'].includes(location.hostname)) {
+  const files = ['index.html', 'css/style.css', 'js/data.js', 'js/game.js', 'js/ui.js', 'js/worldmap.js'];
+  let sig = null;
+  setInterval(async () => {
+    try {
+      const parts = await Promise.all(files.map(f =>
+        fetch(f, { method: 'HEAD', cache: 'no-store' }).then(r => r.headers.get('last-modified'))));
+      const s = parts.join('|');
+      if (sig && s !== sig) location.reload();
+      sig = s;
+    } catch (e) { /* server restarting; retry next tick */ }
+  }, 1500);
+}
+</script>
+</body>
+</html>
