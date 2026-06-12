@@ -136,22 +136,38 @@
     toastTimer = setTimeout(() => { t.hidden = true; }, 3200);
   }
 
-  // run engine call with error toast; both return whether the call succeeded
+  // Dispatch a mutating engine call by name. Local mode: synchronous, exactly
+  // the pre-multiplayer behavior (undo snapshot for `act`, toast on throw).
+  // Online mode: POST to the server; the echoed payload updates the mirrored
+  // state before the promise resolves. Always returns a Promise of {ok, ret}
   // so call sites can fire sounds/animations only on success.
-  function run(fn) {
-    let ok = false;
-    try { fn(); ok = true; } catch (e) { toast(e.message.replace(/^Illegal: /, '')); sfx('error'); }
-    refresh();
-    return ok;
+  async function dispatch(fn, args, undoable) {
+    if (!globalThis.Net || !Net.online) {
+      const snap = undoable ? Game.snapshot() : null;
+      let ok = false, ret;
+      try {
+        ret = Game[fn](...args);
+        if (undoable) ui.undoStack.push(snap);
+        ok = true;
+      } catch (e) { toast(e.message.replace(/^Illegal: /, '')); sfx('error'); }
+      if (undoable) ui.selectedCity = null;
+      refresh();
+      return { ok, ret };
+    }
+    try {
+      const j = await Net.action(fn, args);
+      if (undoable) ui.selectedCity = null;
+      Net.applyPayload(j.room); // no-op if the SSE echo of this action won the race
+      refresh();                // re-render regardless, so cleared selection sticks
+      return { ok: true, ret: j.ret };
+    } catch (e) {
+      toast(e.message); sfx('error');
+      refresh();
+      return { ok: false };
+    }
   }
-  function act(fn) {
-    const snap = Game.snapshot();
-    let ok = false;
-    try { fn(); ui.undoStack.push(snap); ok = true; } catch (e) { toast(e.message.replace(/^Illegal: /, '')); sfx('error'); }
-    ui.selectedCity = null;
-    refresh();
-    return ok;
-  }
+  const act = (fn, args) => dispatch(fn, args, true);
+  const run = (fn, args) => dispatch(fn, args, false);
 
   // Expanding rings at a city — feedback for actions that land on the map.
   function cityPulse(city, color) {
@@ -724,10 +740,10 @@
     }
     for (const o of opts) {
       menu.append(el('button', {
-        onclick: () => {
+        onclick: async () => {
           if (o.type === 'opex') { pickOpexCard(name); return; }
           const from = g.players[pawnIdx].location;
-          if (act(() => Game.performMove(pawnIdx, o.type, name))) {
+          if ((await act('performMove', [pawnIdx, o.type, name])).ok) {
             sfx('move');
             cityPulse(name, '#38bdf8');
             if (o.type === 'drive') animateDrive(from, name); // a car for the road
@@ -755,10 +771,10 @@
       me.hand.forEach((c, i) => {
         if (c.type !== 'city') return;
         list.append(el('button', {
-          onclick: () => {
+          onclick: async () => {
             closeModal();
             const from = g.players[g.current].location;
-            if (act(() => Game.performMove(g.current, 'opex', dest, i))) {
+            if ((await act('performMove', [g.current, 'opex', dest, i])).ok) {
               sfx('move');
               cityPulse(dest, '#38bdf8');
               animateFlight(from, dest); // operations flight
@@ -821,7 +837,7 @@
         }, g.contingency ? `Stored: ${g.contingency}` : 'Retrieve Event Card'));
       }
       grid.append(el('button', {
-        class: 'wide', onclick: () => { if (act(() => Game.pass())) sfx('click'); },
+        class: 'wide', onclick: async () => { if ((await act('pass', [])).ok) sfx('click'); },
       }, `End Actions (forfeit ${g.actionsLeft})`));
       grid.append(el('button', {
         class: 'wide', disabled: !ui.undoStack.length,
@@ -834,26 +850,24 @@
           'Drawn: ', drawn.map(c => cardChip(c)).flat()));
       }
       grid.append(el('button', {
-        class: 'primary wide', onclick: () => {
-          let card;
+        class: 'primary wide', onclick: async () => {
           const logMark = G().log.length;
-          run(() => { card = Game.drawPlayerCard(); });
-          if (card) {
-            sfx(card.type === 'epidemic' ? 'epidemic' : 'draw');
-            animatePlayerDraw(card);
+          const r = await run('drawPlayerCard', []);
+          if (r.ok && r.ret) {
+            sfx(r.ret.type === 'epidemic' ? 'epidemic' : 'draw');
+            animatePlayerDraw(r.ret);
             animateOutbreaks(logMark);
           }
         },
       }, `Draw Player Card (${g.cardsToDraw} left)`));
     } else if (g.phase === 'infect') {
       grid.append(el('button', {
-        class: 'primary wide', onclick: () => {
-          let card;
+        class: 'primary wide', onclick: async () => {
           const logMark = G().log.length;
-          run(() => { card = Game.flipInfectionCard(); });
-          if (card) {
+          const r = await run('flipInfectionCard', []);
+          if (r.ok && r.ret) {
             sfx('infect');
-            animateInfection(card);
+            animateInfection(r.ret);
             animateOutbreaks(logMark);
           }
         },
@@ -976,9 +990,9 @@
 
   function doTreat(cubesHere) {
     const loc = G().players[G().current].location;
-    const treated = c => {
+    const treated = async c => {
       const before = G().cityCubes[loc][c];
-      if (act(() => Game.treat(c))) {
+      if ((await act('treat', [c])).ok) {
         sfx('treat');
         cityPulse(loc, '#4ade80');
         floatText(loc, `−${before - G().cityCubes[loc][c]} ${c}`, HEX[c]);
@@ -1003,7 +1017,9 @@
   function doBuild() {
     const g = G();
     const loc = g.players[g.current].location;
-    const built = from => { if (act(() => Game.build(from))) { sfx('build'); cityPulse(loc, '#f8fafc'); } };
+    const built = async from => {
+      if ((await act('build', from ? [from] : [])).ok) { sfx('build'); cityPulse(loc, '#f8fafc'); }
+    };
     if (g.stations.length < Game.MAX_STATIONS) { built(); return; }
     openModal('Build Research Station', dlg => {
       dlg.append(el('p', { class: 'sub' }, 'All 6 stations are on the board. Choose one to move here.'));
@@ -1041,9 +1057,9 @@
           }
           pickRow.append(el('button', {
             class: 'primary', disabled: selected.size !== need,
-            onclick: () => {
+            onclick: async () => {
               closeModal();
-              if (act(() => Game.discoverCure(color, [...selected]))) {
+              if ((await act('discoverCure', [color, [...selected]])).ok) {
                 sfx('cure');
                 cureBanner(color);
               }
@@ -1084,7 +1100,7 @@
       const list = el('div', { class: 'list' });
       for (const o of options) {
         list.append(el('button', {
-          onclick: () => { closeModal(); if (act(() => Game.shareKnowledge(o.gi, o.ti, o.hi))) sfx('share'); },
+          onclick: async () => { closeModal(); if ((await act('shareKnowledge', [o.gi, o.ti, o.hi])).ok) sfx('share'); },
         }, o.label));
       }
       dlg.append(list, el('div', { class: 'btnrow' }, el('button', { onclick: closeModal }, 'Cancel')));
@@ -1098,7 +1114,7 @@
       const list = el('div', { class: 'list' });
       for (const c of g.playerDiscard.filter(c => c.type === 'event')) {
         list.append(el('button', {
-          onclick: () => { closeModal(); if (act(() => Game.contingencyTake(c.event))) sfx('event'); },
+          onclick: async () => { closeModal(); if ((await act('contingencyTake', [c.event])).ok) sfx('event'); },
         }, `${c.event} — ${EVENT[c.event].desc}`));
       }
       dlg.append(list, el('div', { class: 'btnrow' }, el('button', { onclick: closeModal }, 'Cancel')));
@@ -1107,24 +1123,24 @@
 
   // ================= Event flows =================
 
-  function playEventFlow(playerIdx, source, name) {
+  async function playEventFlow(playerIdx, source, name) {
     const g = G();
     if (!Game.canPlayEvent(name)) { toast('That event cannot be played right now.'); return; }
     ui.undoStack = []; // events can be played by either player; keep undo simple & honest
     closeModal();
 
     if (name === 'One Quiet Night') {
-      if (run(() => Game.playEvent(playerIdx, source, name, {}))) sfx('event');
+      if ((await run('playEvent', [playerIdx, source, name, {}])).ok) sfx('event');
     } else if (name === 'Forecast') {
       ui.forecastOrder = null; // must be cleared BEFORE run(): refresh() seeds it from the new forecast
-      if (run(() => Game.playEvent(playerIdx, source, name, {}))) sfx('event');
+      if ((await run('playEvent', [playerIdx, source, name, {}])).ok) sfx('event');
     } else if (name === 'Resilient Population') {
       openModal('Resilient Population', dlg => {
         dlg.append(el('p', { class: 'sub' }, 'Remove one card from the infection discard pile — that city can never be drawn again (until reshuffled cards run out).'));
         const list = el('div', { class: 'list' });
         g.infectionDiscard.forEach((c, i) => {
           list.append(el('button', {
-            onclick: () => { closeModal(); if (run(() => Game.playEvent(playerIdx, source, name, { discardIdx: i }))) { sfx('event'); cityPulse(c.city, '#4ade80'); } },
+            onclick: async () => { closeModal(); if ((await run('playEvent', [playerIdx, source, name, { discardIdx: i }])).ok) { sfx('event'); cityPulse(c.city, '#4ade80'); } },
           }, `Remove ${EMOJI[c.city] ? EMOJI[c.city] + ' ' : ''}${c.city} (${c.color})`));
         });
         if (g.infectionDiscard.length) dlg.append(list);
@@ -1139,9 +1155,9 @@
           list.append(el('button', {
             onclick: () => {
               closeModal();
-              startSelectMode(`Airlift: click a destination for ${p.name}`, city => {
+              startSelectMode(`Airlift: click a destination for ${p.name}`, async city => {
                 const from = G().players[i].location;
-                if (run(() => Game.playEvent(playerIdx, source, name, { pawnIdx: i, city }))) { sfx('event'); cityPulse(city, '#4ade80'); animateFlight(from, city); }
+                if ((await run('playEvent', [playerIdx, source, name, { pawnIdx: i, city }])).ok) { sfx('event'); cityPulse(city, '#4ade80'); animateFlight(from, city); }
               });
             },
           }, `${p.name} (${p.role}) — currently in ${p.location}`));
@@ -1149,7 +1165,7 @@
         dlg.append(list, el('div', { class: 'btnrow' }, el('button', { onclick: closeModal }, 'Cancel')));
       });
     } else if (name === 'Government Grant') {
-      startSelectMode('Government Grant: click a city to build a research station', city => {
+      startSelectMode('Government Grant: click a city to build a research station', async city => {
         const g2 = G();
         if (g2.stations.includes(city)) { toast('A station is already there.'); refresh(); return; }
         if (g2.stations.length >= Game.MAX_STATIONS) {
@@ -1158,13 +1174,13 @@
             const list = el('div', { class: 'list' });
             for (const s of g2.stations) {
               list.append(el('button', {
-                onclick: () => { closeModal(); if (run(() => Game.playEvent(playerIdx, source, name, { city, relocateFrom: s }))) { sfx('event'); cityPulse(city, '#f8fafc'); } },
+                onclick: async () => { closeModal(); if ((await run('playEvent', [playerIdx, source, name, { city, relocateFrom: s }])).ok) { sfx('event'); cityPulse(city, '#f8fafc'); } },
               }, `Move station from ${s}`));
             }
             dlg.append(list, el('div', { class: 'btnrow' }, el('button', { onclick: closeModal }, 'Cancel')));
           });
         } else {
-          if (run(() => Game.playEvent(playerIdx, source, name, { city }))) { sfx('event'); cityPulse(city, '#f8fafc'); }
+          if ((await run('playEvent', [playerIdx, source, name, { city }])).ok) { sfx('event'); cityPulse(city, '#f8fafc'); }
         }
       });
     }
@@ -1593,10 +1609,10 @@
       dlg.append(listBox);
       dlg.append(el('div', { class: 'btnrow' },
         el('button', {
-          class: 'primary', onclick: () => {
+          class: 'primary', onclick: async () => {
             const o = ui.forecastOrder || g.forecastPending.map((_, i) => i);
             ui.forecastOrder = null;
-            if (run(() => Game.forecastCommit(o))) sfx('click');
+            if ((await run('forecastCommit', [o])).ok) sfx('click');
           },
         }, 'Confirm order')));
       box.append(dlg);
@@ -1624,7 +1640,7 @@
         }, `${g.players[h.i].name}: play Resilient Population now`));
       }
       btns.append(el('button', {
-        class: 'primary', onclick: () => { if (run(() => Game.intensify())) sfx('draw'); },
+        class: 'primary', onclick: async () => { if ((await run('intensify', [])).ok) sfx('draw'); },
       }, 'Intensify (shuffle discard on top)'));
       dlg.append(btns);
       box.append(dlg);
@@ -1643,12 +1659,12 @@
       p.hand.forEach((c, i) => {
         if (c.type === 'event') {
           hand.append(cardChip(c, {
-            onclick: () => run(() => Game.discardForLimit(pi, i)),
+            onclick: () => run('discardForLimit', [pi, i]),
             onPlay: () => playEventFlow(pi, 'hand', c.event),
             playDisabled: !Game.canPlayEvent(c.event),
           }));
         } else {
-          hand.append(cardChip(c, { onclick: () => run(() => Game.discardForLimit(pi, i)) }));
+          hand.append(cardChip(c, { onclick: () => run('discardForLimit', [pi, i]) }));
         }
       });
       dlg.append(hand);
@@ -1812,7 +1828,14 @@
   if (autosave) {
     try {
       const g = Game.load(autosave);
-      if (g && g.players && !g.result) {
+      const integrity = Game.validate(g);
+      if (!integrity.ok) {
+        // A historical bug corrupted this save (e.g. duplicated cards) — do
+        // not resume it; playing on would only deepen the damage.
+        console.warn('Corrupted save discarded:', integrity.problems);
+        localStorage.removeItem(SAVE_KEY);
+        toast('Saved game was corrupted and has been discarded — please start a new game.');
+      } else if (g && g.players && !g.result) {
         $('#app').hidden = false;
         ui.undoStack = [];
         refresh();
