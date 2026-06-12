@@ -22,26 +22,69 @@
     red:    { name: 'the Crimson Fever',     region: 'across East Asia and the Pacific' },
   };
 
+  // Generic fallbacks, used only if a city somehow has no bespoke lore beat.
+  // All 48 cities are covered in data.js cityLore, so these rarely fire — but
+  // they're kept in the same darkly-comic register for safety.
   const EPIDEMIC_NEWS = [
-    (s, c) => `BREAKING — A superspreader event in ${c} sends ${s.name} racing out of control. Health ministries scramble.`,
-    (s, c) => `ALERT — ${c} reports a catastrophic surge of ${s.name}. Hospitals overflow and borders slam shut ${s.region}.`,
-    (s, c) => `${s.name} appears to be mutating. The flare-up in ${c} is spreading faster than any model predicted.`,
-    (s, c) => `Panic empties the markets as ${s.name} erupts in ${c}. The global infection rate ticks upward.`,
-    (s, c) => `Field dispatch: ${c} has become the new epicenter of ${s.name}. Aid convoys are turned back at checkpoints.`,
+    (s, c) => `BREAKING — A superspreader event in ${c} sends ${s.name} out of control. Officials urge calm, then quietly clear the shelves themselves.`,
+    (s, c) => `ALERT — ${c} reports a catastrophic surge of ${s.name}. A spokesperson clarifies yesterday's clarification, then clarifies that.`,
+    (s, c) => `${s.name} appears to be mutating. The flare-up in ${c} is spreading faster than any model, press conference, or task force can keep up with.`,
+    (s, c) => `Panic empties the shops in ${c} as ${s.name} erupts. Citizens hoard toilet paper, a product with no known relationship to the disease.`,
+    (s, c) => `Field dispatch: ${c} is the new epicenter of ${s.name}. The plexiglass, at least, has never looked cleaner.`,
   ];
 
   const OUTBREAK_NEWS = [
-    (s, c) => `${c} is overrun — ${s.name} spills into the surrounding cities. Quarantine lines buckle.`,
-    (s, c) => `Martial law is declared in ${c} as ${s.name} breaches every containment cordon.`,
-    (s, c) => `Refugees stream out of ${c}; ${s.name} rides the roads outward ${s.region}.`,
-    (s, c) => `${c} goes dark. Communications fail as ${s.name} sweeps the region in hours.`,
+    (s, c) => `${c} is overrun — ${s.name} spills into the surrounding cities. The cordon is defeated by a man who "just needed to pop out."`,
+    (s, c) => `Martial law is declared in ${c} as ${s.name} breaches every cordon. The R-naught, officials note grimly, is now firmly an R-several.`,
+    (s, c) => `Refugees stream out of ${c}; ${s.name} rides the roads outward ${s.region}, overtaking the official guidance on which way to flee.`,
+    (s, c) => `${c} goes dark. As ${s.name} sweeps the region, the only broadcast still running is a celebrity singing "Imagine" from a marble kitchen.`,
   ];
 
   const CURE_NEWS = [
-    s => `HOPE — Researchers announce a working cure for ${s.name}. Production lines spin up ${s.region}.`,
-    s => `A second breakthrough: ${s.name} now has a cure. Morale lifts on the front lines ${s.region}.`,
-    s => `The tide turns. With a cure for ${s.name} in hand, three of four strains are now treatable.`,
+    s => `HOPE — Researchers announce a working cure for ${s.name}. It is immediately undercut by a $370 USB stick claiming to do the same thing.`,
+    s => `A second breakthrough: ${s.name} now has a cure. Morale lifts ${s.region}, though a vocal faction insists garlic was working fine.`,
+    s => `The tide turns. With a cure for ${s.name} in hand, three of four strains are treatable — and everyone suddenly claims to have predicted this all along.`,
   ];
+
+  // The escalating world arc. As severity rises (epidemics drawn + outbreaks),
+  // worldStage() climbs through these tonal stages; checkWorldStage() fires the
+  // matching bulletin once, the first time each stage is reached. Stage 0
+  // (Denial) has no transition bulletin — the opening narration sets that tone.
+  const STAGE_NEWS = [
+    null, // 0: Denial
+    'WORLD — Denial gives way to panic. Shelves empty of toilet paper on four continents for reasons no virologist can explain, and the planet\'s sourdough starters now outnumber its citizens.',
+    'WORLD — The system buckles. Hospitals overflow but the plexiglass has never been cleaner; a head of state muses on live television about injecting disinfectant, and the makers of bleach issue a statement begging the public not to.',
+    'WORLD — The endgame. Officials declare the crisis "basically under control" for the fourth time, the colloidal-silver believers have all turned a permanent shade of blue, and everyone, everywhere, is still arguing about masks.',
+  ];
+
+  // Periodic "situation reports": comic wire copy that splices in the LIVE
+  // numbers (cases, infected cities, outbreaks, infection rate, cures), so the
+  // ticker keeps narrating the actual evolving state, not a canned script.
+  // Rotated deterministically (no RNG) so tests stay reproducible.
+  const SITREP = [
+    s => `SITUATION REPORT, Day ${s.turn} — ${s.cubes} active cases across ${s.cities} cities, ${s.outbreaks} outbreaks on the board. A spokesperson describes the picture as "fluid."`,
+    s => `WIRE — The infection deck now flips ${s.rate} cities a turn. Authorities urge everyone to "flatten the curve," gesturing at a curve that is, frankly, a wall.`,
+    s => `BULLETIN — ${s.cured} of four cures secured, ${s.outbreaks} outbreaks logged. The market rallies on the news, then remembers what the news was.`,
+    s => `DISPATCH, Day ${s.turn} — ${s.cubes} cubes loose, ${s.stations} research station${s.stations === 1 ? '' : 's'} still standing. Officials unveil a bold new strategy of unveiling strategies.`,
+    s => `FIELD UPDATE — ${s.cities} cities now report cases and the rate sits at ${s.rate}. The press conference is rescheduled, then the rescheduling is rescheduled.`,
+  ];
+
+  // Fire one situation report, built from the current game state.
+  function sitrep() {
+    newsBeat(() => {
+      const s = story();
+      const snap = {
+        turn: G.turn,
+        cubes: cubesOnBoard(),
+        cities: infectedCityCount(),
+        outbreaks: G.outbreaks,
+        rate: infectionRate(),
+        cured: curesCount(),
+        stations: G.stations.length,
+      };
+      return rotate(SITREP, s.sitreps++)(snap);
+    });
+  }
 
   let G = null;
 
@@ -76,8 +119,16 @@
   // Narration counters, lazily created so saves written before the storyline
   // existed (which have no `story` field) still work after loading.
   function story() {
-    if (!G.story) G.story = { epidemics: 0, outbreaks: 0, cures: 0, milestones: {} };
-    return G.story;
+    if (!G.story) G.story = {};
+    const s = G.story;
+    if (s.epidemics == null) s.epidemics = 0;
+    if (s.outbreaks == null) s.outbreaks = 0;
+    if (s.cures == null) s.cures = 0;
+    if (!s.milestones) s.milestones = {};
+    if (!s.seen) s.seen = {};      // cities that have entered the storyline
+    if (s.stage == null) s.stage = 0; // current world-arc stage (0..3)
+    if (s.sitreps == null) s.sitreps = 0; // situation-report rotation counter
+    return s;
   }
 
   // Emit a news beat. The message is built inside a try/catch because narration
@@ -90,6 +141,62 @@
   // Deterministic rotation through a template list so repeated beats vary
   // without ever depending on RNG (keeps tests reproducible).
   function rotate(arr, i) { return arr[((i % arr.length) + arr.length) % arr.length]; }
+
+  // Fire a city's bespoke storyline beat (kind = 'reach' | 'crisis'), falling
+  // back to a generic template builder if that city has no lore for the kind.
+  // `tail`, if given, appends a live state-derived clause so the same bespoke
+  // line still reflects the evolving game (rising rate, outbreak tally, …).
+  function cityBeat(city, kind, fallback, tail) {
+    newsBeat(() => {
+      const lore = D.cityLore && D.cityLore[city];
+      let line = (lore && lore[kind]) || (fallback ? fallback() : null);
+      if (line && tail) { const t = tail(); if (t) line += ' ' + t; }
+      return line;
+    });
+  }
+
+  // Live board snapshot for state-driven bulletins.
+  function cubesOnBoard() {
+    let n = 0;
+    for (const c of D.cities) { const cc = G.cityCubes[c.name]; n += cc.blue + cc.yellow + cc.black + cc.red; }
+    return n;
+  }
+  function infectedCityCount() {
+    let n = 0;
+    for (const c of D.cities) { const cc = G.cityCubes[c.name]; if (cc.blue + cc.yellow + cc.black + cc.red) n++; }
+    return n;
+  }
+  function curesCount() { return COLORS.filter(c => G.cures[c]).length; }
+
+  // The first time a city is infected during play, give it a spotlight 'reach'
+  // beat. Idempotent: each city is narrated at most once per game.
+  function markReached(city) {
+    const s = story();
+    if (s.seen[city]) return;
+    s.seen[city] = true;
+    cityBeat(city, 'reach', null);
+  }
+
+  // World-arc severity, derived purely from monotonic counters so it only ever
+  // climbs: 0 Denial -> 1 Panic -> 2 Collapse -> 3 Endgame.
+  function worldStage() {
+    const e = story().epidemics, o = G.outbreaks;
+    if (o >= 6 || e >= 5) return 3;
+    if (o >= 3 || e >= 3) return 2;
+    if (o >= 1 || e >= 1) return 1;
+    return 0;
+  }
+
+  // Advance through any newly-reached stages, firing each transition bulletin once.
+  function checkWorldStage() {
+    const s = story();
+    const now = worldStage();
+    while (s.stage < now) {
+      s.stage++;
+      const msg = STAGE_NEWS[s.stage];
+      if (msg) newsBeat(() => msg);
+    }
+  }
 
   function assert(cond, msg) {
     if (!cond) throw new Error('Illegal: ' + msg);
@@ -136,7 +243,7 @@
       lastDrawn: [],
       result: null, // {win:bool, reason}
       log: [],
-      story: { epidemics: 0, outbreaks: 0, cures: 0, milestones: {} }, // narration counters
+      story: { epidemics: 0, outbreaks: 0, cures: 0, milestones: {}, seen: {}, stage: 0, sitreps: 0 }, // narration state
     };
     for (const c of D.cities) G.cityCubes[c.name] = { blue: 0, yellow: 0, black: 0, red: 0 };
 
@@ -164,17 +271,19 @@
     // Infection deck + initial infections: 3/3/3 cities at 3/2/1 cubes.
     G.infectionDeck = shuffle(D.cities.map(c => ({ city: c.name, color: c.color })));
     log(`— Setup: initial infections —`);
+    const hotZones = []; // cities seeded with the full 3 cubes — this game's worst spots
     for (const count of [3, 3, 3, 2, 2, 2, 1, 1, 1]) {
       const card = G.infectionDeck.pop();
       G.infectionDiscard.push(card);
       G.cityCubes[card.city][card.color] = count; // setup ignores role protections
       G.cubeSupply[card.color] -= count;
+      if (count === 3) { hotZones.push(card.city); G.story.seen[card.city] = true; }
       log(`${card.city} starts with ${count} ${card.color} cube${count > 1 ? 's' : ''}.`);
     }
     log(`Research station built in ${START_CITY}. All pawns start there.`);
-    narrate('GENEVA — The WHO declares a Public Health Emergency of International Concern. Four novel pathogens have emerged at once.');
-    narrate(`${STRAIN.blue.name} stirs ${STRAIN.blue.region}; ${STRAIN.yellow.name} spreads ${STRAIN.yellow.region}; ${STRAIN.black.name} takes hold ${STRAIN.black.region}; ${STRAIN.red.name} surges ${STRAIN.red.region}.`);
-    narrate('A field team mobilizes from CDC Atlanta. The world is watching.');
+    narrate('GENEVA — The WHO convenes an emergency panel to decide what the four new pathogens must NOT be called. After six weeks it rules out every place, person, animal, and food, settling on names guaranteed not to alarm anyone or hurt tourism.');
+    narrate(`${STRAIN.blue.name} stirs ${STRAIN.blue.region}; ${STRAIN.yellow.name} spreads ${STRAIN.yellow.region}; ${STRAIN.black.name} takes hold ${STRAIN.black.region}; ${STRAIN.red.name} surges ${STRAIN.red.region}. Officials advise that there is no need to cancel anything, probably.`);
+    narrate(`A field team mobilizes from CDC Atlanta. The earliest hot zones — ${hotZones.join(', ')} — are already past saving, yet markets shrug and a cable-news chyron asks whether the whole thing might just be a bad flu.`);
     log(`${G.players[0].name}'s turn begins.`, 'good');
     return G;
   }
@@ -240,8 +349,8 @@
     G.phase = 'over';
     log(win ? `VICTORY — ${reason}` : `DEFEAT — ${reason}`, win ? 'good' : 'bad');
     newsBeat(() => win
-      ? 'THE WORLD EXHALES — with every disease cured, the pandemic is declared over. The field team is hailed across every front page.'
-      : `SILENCE FALLS — ${reason}. The campaign is lost, and the world goes dark.`);
+      ? 'THE WORLD EXHALES — every disease cured, the pandemic declared over. Survivors mark the occasion in the time-honored way: by panic-buying toilet paper, just in case.'
+      : `SILENCE FALLS — ${reason}. The final press release declares the situation "basically under control," then there is no one left to read it.`);
   }
 
   function removeCubes(city, color, count) {
@@ -264,6 +373,7 @@
     }
     G.cubeSupply[color]--;
     cc[color]++;
+    markReached(city);
   }
 
   function outbreak(city, color, chain) {
@@ -271,17 +381,22 @@
     chain.add(city);
     G.outbreaks++;
     log(`OUTBREAK of ${color} in ${city}! (${G.outbreaks}/${MAX_OUTBREAKS})`, 'bad');
-    newsBeat(() => rotate(OUTBREAK_NEWS, story().outbreaks++)(STRAIN[color], city));
+    story().seen[city] = true; // the city's spotlight is its crisis beat, below
+    story().outbreaks++;
+    cityBeat(city, 'crisis',
+      () => rotate(OUTBREAK_NEWS, story().outbreaks - 1)(STRAIN[color], city),
+      () => `That makes ${G.outbreaks} of 8 outbreaks worldwide.`);
     if (G.outbreaks === 4) newsBeat(() => {
       if (story().milestones.half) return null;
       story().milestones.half = true;
-      return 'World leaders convene an emergency summit as the global outbreak tally hits four. The public mood turns to dread.';
+      return 'World leaders convene an emergency summit as the outbreak tally hits four. They emerge to announce the formation of a committee to schedule a future summit.';
     });
     if (G.outbreaks === 6) newsBeat(() => {
       if (story().milestones.brink) return null;
       story().milestones.brink = true;
-      return 'Six outbreaks and counting. Society teeters — two more and there will be no coming back.';
+      return 'Six outbreaks and counting. Society teeters — two more and there is no coming back. Officials respond by installing more plexiglass and a touchless mustard dispenser.';
     });
+    checkWorldStage();
     if (G.outbreaks >= MAX_OUTBREAKS) {
       gameOver(false, 'worldwide panic — the 8th outbreak occurred');
       return;
@@ -368,6 +483,9 @@
     G.opexUsed = false;
     G.phase = 'actions';
     log(`${G.players[G.current].name}'s turn begins.`, 'good');
+    // Once per full round (back to the first player), file a live situation
+    // report so the ticker keeps pace with the state as it evolves.
+    if (G.current === 0 && G.turn > 1) sitrep();
   }
 
   // ---------------- Player actions ----------------
@@ -460,7 +578,7 @@
     log(`${me.name} treats ${color} in ${me.location} (removed ${n}).`);
     if (isErad(color)) {
       log(`The ${color} disease has been ERADICATED!`, 'good');
-      newsBeat(() => `${STRAIN[color].name} is gone for good — the last known case has been cleared. A genuine victory for the campaign.`);
+      newsBeat(() => `${STRAIN[color].name} is gone for good — the last known case cleared. A genuine victory, immediately claimed as a personal triumph by everyone who once recommended drinking bleach.`);
     }
     spendAction();
   }
@@ -504,7 +622,7 @@
     for (let i = 0; i < G.players.length; i++) medicSweep(i);
     if (isErad(color)) {
       log(`The ${color} disease has been ERADICATED!`, 'good');
-      newsBeat(() => `${STRAIN[color].name} is gone for good — the last known case has been cleared. A genuine victory for the campaign.`);
+      newsBeat(() => `${STRAIN[color].name} is gone for good — the last known case cleared. A genuine victory, immediately claimed as a personal triumph by everyone who once recommended drinking bleach.`);
     }
     if (COLORS.every(c => G.cures[c])) { gameOver(true, 'all four diseases have been cured'); return; }
     spendAction();
@@ -566,8 +684,13 @@
       const ic = G.infectionDeck.shift(); // bottom card
       G.infectionDiscard.push(ic);
       log(`Epidemic strikes ${ic.city}.`, 'bad');
-      newsBeat(() => rotate(EPIDEMIC_NEWS, story().epidemics++)(STRAIN[ic.color], ic.city));
+      story().epidemics++;
+      story().seen[ic.city] = true; // its crisis beat is its spotlight; suppress a later 'reach'
+      cityBeat(ic.city, 'crisis',
+        () => rotate(EPIDEMIC_NEWS, story().epidemics - 1)(STRAIN[ic.color], ic.city),
+        () => `The infection rate climbs to ${infectionRate()} cards a turn.`);
       epidemicInfect(ic);
+      checkWorldStage();
       if (!G.result) G.phase = 'epidemicPause';
     } else {
       G.players[G.current].hand.push(card);
@@ -735,7 +858,15 @@
   // Backfill fields added after a save was written, so older saves/snapshots
   // (e.g. from before narration existed) load without crashing the engine.
   function migrate(g) {
-    if (!g.story) g.story = { epidemics: 0, outbreaks: 0, cures: 0, milestones: {} };
+    if (!g.story) g.story = {};
+    const s = g.story;
+    if (s.epidemics == null) s.epidemics = 0;
+    if (s.outbreaks == null) s.outbreaks = 0;
+    if (s.cures == null) s.cures = 0;
+    if (!s.milestones) s.milestones = {};
+    if (!s.seen) s.seen = {};
+    if (s.stage == null) s.stage = 0;
+    if (s.sitreps == null) s.sitreps = 0;
     return g;
   }
 
