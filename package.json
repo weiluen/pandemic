@@ -1,0 +1,12 @@
+{
+  "name": "pandemic",
+  "private": true,
+  "description": "Cooperative Pandemic board game — hotseat and online multiplayer. Zero dependencies.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/rules.js && node test/fuzz.js 100 && node test/server.js && node test/ai.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

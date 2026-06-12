@@ -14,7 +14,7 @@ require('./js/data.js');
 require('./js/game.js');
 const Game = globalThis.Game;
 
-const PORT = +(process.argv[2] || 8421);
+const PORT = +(process.argv[2] || process.env.PORT || 8421);
 const ROOT = __dirname;
 const SAVE_FILE = process.env.PANDEMIC_SAVE || path.join(ROOT, 'saves', 'rooms.json');
 const ROOM_TTL = 24 * 60 * 60 * 1000;
