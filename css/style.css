@@ -528,3 +528,12 @@ button:active:not(:disabled) { transform: scale(0.94); }
 .gameover h2 { font-size: 26px; }
 .gameover h2.win { color: var(--good); }
 .gameover h2.loss { color: var(--bad); }
+
+/* ---- online lobby & connection ---- */
+.connDot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.roomcode { display: flex; gap: 8px; justify-content: center; margin: 10px 0 16px; }
+.roomcode span {
+  font-size: 34px; font-weight: 800; letter-spacing: 1px;
+  background: #0b1220; border: 1px solid #2b3a55; border-radius: 10px;
+  padding: 6px 14px; color: var(--accent, #38bdf8);
+}

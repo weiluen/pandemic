@@ -223,6 +223,7 @@
   }
 
   function save() {
+    if (globalThis.Net && Net.online) return; // online games live on the server
     if (G() && !G().result) localStorage.setItem(SAVE_KEY, Game.serialize());
     else localStorage.removeItem(SAVE_KEY);
   }
@@ -323,6 +324,97 @@
         }, 'Start Game')),
     );
     box.append(dlg);
+
+    // Online play: only offered when the page is served by server.js.
+    Net.detect().then(up => {
+      if (!up) return;
+      const odlg = el('div', { class: 'dialog', style: 'margin-top:14px' });
+      odlg.append(el('p', { class: 'boxtitle' }, '🌐 Play online'));
+      odlg.append(el('p', { class: 'sub' }, 'Host a room and share its 4-letter code, or join a friend’s room. Everyone plays from their own computer.'));
+      const nameIn = el('input', { type: 'text', id: 'onlinename', placeholder: 'Your name', value: localStorage.getItem('pandemic-name') || '' });
+      odlg.append(el('div', { class: 'setuprow' }, el('label', {}, 'Name'), nameIn));
+      const codeIn = el('input', { type: 'text', id: 'joincode', placeholder: 'CODE', maxlength: 4, style: 'text-transform:uppercase;width:90px' });
+      const oerr = el('div', { style: 'color:var(--bad);font-weight:600;min-height:18px;margin-top:6px' });
+      const myName = () => {
+        const n = nameIn.value.trim();
+        if (n) localStorage.setItem('pandemic-name', n);
+        return n;
+      };
+      odlg.append(el('div', { class: 'btnrow', style: 'justify-content:flex-start' },
+        el('button', {
+          class: 'primary', onclick: async () => {
+            try { await Net.create(myName()); } catch (e) { oerr.textContent = e.message; }
+          },
+        }, 'Create Room'),
+        el('span', { style: 'margin-left:14px' }),
+        codeIn,
+        el('button', {
+          onclick: async () => {
+            try { await Net.join(codeIn.value, myName()); } catch (e) { oerr.textContent = e.message; }
+          },
+        }, 'Join Room')));
+      odlg.append(oerr);
+      dlg.append(odlg);
+    });
+  }
+
+  // Online lobby: roster fills in live via SSE; the host configures and starts.
+  function showLobby() {
+    const box = $('#setup');
+    box.hidden = false;
+    box.innerHTML = '';
+    $('#app').hidden = true;
+    const isHost = Net.seats.length && Net.seat === 0;
+    const dlg = el('div', { class: 'dialog' });
+    dlg.append(el('p', { class: 'bigtitle' }, 'PANDEMIC'));
+    dlg.append(el('p', { class: 'subtitle' }, 'Online lobby — share the room code. The game starts for everyone at once.'));
+    dlg.append(el('div', { class: 'roomcode' }, ...Net.code.split('').map(ch => el('span', {}, ch))));
+
+    const list = el('div');
+    Net.seats.forEach((s, i) => {
+      list.append(el('div', { class: 'setuprow' },
+        el('span', { class: 'connDot', style: `background:${s.connected ? 'var(--good)' : 'var(--bad)'}` }),
+        el('label', {}, `${i + 1}. ${s.name}${i === 0 ? ' (host)' : ''}${i === Net.seat ? ' — you' : ''}`)));
+    });
+    for (let i = Net.seats.length; i < 4; i++) {
+      list.append(el('div', { class: 'setuprow', style: 'opacity:.45' },
+        el('span', { class: 'connDot', style: 'background:var(--dim)' }),
+        el('label', {}, `${i + 1}. waiting for a player…`)));
+    }
+    dlg.append(list);
+
+    const errLine = el('div', { style: 'color:var(--bad);font-weight:600;min-height:18px;margin-top:8px' });
+    if (isHost) {
+      const epiSel = el('select', {},
+        el('option', { value: 4 }, '4 epidemics — Introductory'),
+        el('option', { value: 5 }, '5 epidemics — Standard'),
+        el('option', { value: 6 }, '6 epidemics — Heroic'));
+      epiSel.value = String(ui.lobbyEpidemics || 4);
+      epiSel.onchange = () => { ui.lobbyEpidemics = +epiSel.value; };
+      dlg.append(el('div', { class: 'setuprow' }, el('label', {}, 'Difficulty'), epiSel));
+      dlg.append(errLine);
+      dlg.append(el('div', { class: 'btnrow' },
+        el('button', { onclick: leaveOnline }, 'Leave'),
+        el('button', {
+          class: 'primary', disabled: Net.seats.length < 2,
+          onclick: async () => {
+            try { await Net.start(+epiSel.value, null); } catch (e) { errLine.textContent = e.message; }
+          },
+        }, Net.seats.length < 2 ? 'Waiting for players…' : 'Start Game')));
+    } else {
+      dlg.append(errLine);
+      dlg.append(el('div', { class: 'btnrow' },
+        el('button', { onclick: leaveOnline }, 'Leave'),
+        el('span', { class: 'sub', style: 'align-self:center' }, 'Waiting for the host to start…')));
+    }
+    box.append(dlg);
+  }
+
+  function leaveOnline() {
+    Net.leave();
+    $('#app').hidden = true;
+    ui.turnKey = null;
+    showSetup();
   }
 
   // On-demand viewer for the infection discard pile (public knowledge in Pandemic).
@@ -1806,6 +1898,20 @@
     }
   }
 
+  // Online: every applied server payload lands here (from SSE or a POST echo).
+  // Routes between lobby and board, then replays other players' action beats.
+  Net.onUpdate = (p, prevLogLen) => {
+    if (!Net.online) return;
+    if (Net.status === 'lobby') { showLobby(); return; }
+    $('#setup').hidden = true;
+    $('#app').hidden = false;
+    refresh();
+    if (p && p.state && prevLogLen >= 0 && p.actorSeat !== Net.seat) animateRemote(prevLogLen);
+  };
+
+  // Replaced in the remote-animations step with a log-diff replayer.
+  function animateRemote(logMark) {}
+
   // ================= Boot =================
 
   window.addEventListener('error', e => {
@@ -1822,29 +1928,41 @@
 
   initMapControls();
 
-  // Auto-resume: an unfinished game in localStorage picks up exactly where it left off.
-  const autosave = localStorage.getItem(SAVE_KEY);
-  let resumed = false;
-  if (autosave) {
-    try {
-      const g = Game.load(autosave);
-      const integrity = Game.validate(g);
-      if (!integrity.ok) {
-        // A historical bug corrupted this save (e.g. duplicated cards) — do
-        // not resume it; playing on would only deepen the damage.
-        console.warn('Corrupted save discarded:', integrity.problems);
-        localStorage.removeItem(SAVE_KEY);
-        toast('Saved game was corrupted and has been discarded — please start a new game.');
-      } else if (g && g.players && !g.result) {
-        $('#app').hidden = false;
-        ui.undoStack = [];
-        refresh();
-        toast('Saved game resumed.');
-        resumed = true;
+  (async function boot() {
+    // 1) an online session resumes first (room code + token in localStorage)
+    const sess = Net.session();
+    if (sess && await Net.detect()) {
+      try {
+        await Net.join(sess.code, null, sess.token);
+        toast('Rejoined online game.');
+        return; // SSE payload routes to lobby or board via Net.onUpdate
+      } catch (e) {
+        Net.leave(); // room gone or token stale — fall through to local flow
       }
-    } catch (e) {
-      localStorage.removeItem(SAVE_KEY);
     }
-  }
-  if (!resumed) showSetup();
+    // 2) an unfinished local game picks up exactly where it left off
+    const autosave = localStorage.getItem(SAVE_KEY);
+    if (autosave) {
+      try {
+        const g = Game.load(autosave);
+        const integrity = Game.validate(g);
+        if (!integrity.ok) {
+          // A historical bug corrupted this save (e.g. duplicated cards) — do
+          // not resume it; playing on would only deepen the damage.
+          console.warn('Corrupted save discarded:', integrity.problems);
+          localStorage.removeItem(SAVE_KEY);
+          toast('Saved game was corrupted and has been discarded — please start a new game.');
+        } else if (g && g.players && !g.result) {
+          $('#app').hidden = false;
+          ui.undoStack = [];
+          refresh();
+          toast('Saved game resumed.');
+          return;
+        }
+      } catch (e) {
+        localStorage.removeItem(SAVE_KEY);
+      }
+    }
+    showSetup();
+  })();
 })();
