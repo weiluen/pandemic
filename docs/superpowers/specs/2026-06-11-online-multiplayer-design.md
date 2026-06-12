@@ -187,4 +187,4 @@ games only.
   - undo: allowed for current player within turn, cleared on turn change
   - rejoin by token after dropping the SSE connection
   - SSE delivery: state event received after an action, seq increases
-- Manual test path: `node server.js`, open two browser windows, play a round.
+- Manual test path: `node server.js`, open two browser windows, play a round.ni
