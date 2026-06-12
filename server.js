@@ -386,7 +386,12 @@ async function apiRooms(req, res, url, code, sub) {
     seatObj.connected++;
     touch(room);
     res.write(`retry: 1500\n\n`);
-    broadcast(room); // everyone (incl. this client) sees the fresh roster
+    // Hello frame: a full snapshot the client must accept unconditionally.
+    // After a server restart the room's seq can be lower than what this client
+    // saw before, so plain seq-gating would discard the resync forever.
+    room.seq++;
+    res.write(`data: ${JSON.stringify({ ...payload(room, seat), hello: true })}\n\n`);
+    broadcast(room); // everyone else sees the fresh roster
     req.on('close', () => {
       room.sseClients = room.sseClients.filter(c => c !== client);
       seatObj.connected = Math.max(0, seatObj.connected - 1);
@@ -427,6 +432,11 @@ if (require.main === module) {
     console.log(`Friends connect to your LAN address or tunnel on port ${PORT}.`);
   });
   setInterval(gcRooms, 60 * 60 * 1000).unref();
+  // Deploys/restarts send SIGTERM: flush the debounced save so no broadcast
+  // (and no seq increment) is ever lost across a restart.
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    process.on(sig, () => { saveNow(); process.exit(0); });
+  }
 } else {
   module.exports = { createAppServer, rooms, loadRooms, saveNow, gcRooms, SAVE_FILE };
 }

@@ -74,17 +74,32 @@
     Net.online = true;
     Net.code = code; Net.token = token; Net.seq = 0;
     localStorage.setItem(SESSION_KEY, JSON.stringify({ code, token }));
-    Net.es = new EventSource(`/api/rooms/${code}/events?token=${token}`);
+    connectStream();
+  }
+
+  function connectStream() {
+    if (Net.es) Net.es.close();
+    Net.es = new EventSource(`/api/rooms/${Net.code}/events?token=${Net.token}`);
     Net.es.onmessage = ev => Net.applyPayload(JSON.parse(ev.data));
     Net.es.onopen = () => { Net.sseUp = true; if (Net.onUpdate) Net.onUpdate(null); };
     Net.es.onerror = () => { Net.sseUp = false; if (Net.onUpdate) Net.onUpdate(null); };
   }
 
+  // Backgrounded tabs (laptop lid, phone switch) can lose their stream without
+  // any error event firing. On wake, rebuild it — the hello frame resyncs us.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && Net.online) connectStream();
+  });
+
   // Apply a room payload (from SSE or echoed in an action response). Stale or
   // duplicate payloads are dropped by seq, so the SSE event and the POST echo
   // of the same action can race safely.
   Net.applyPayload = function (p) {
-    if (!Net.online || p.seq <= Net.seq) return;
+    if (!Net.online) return;
+    // hello = authoritative resync after (re)connect: accept it even if the
+    // server's seq went backwards (e.g. restored from a save after a restart).
+    if (p.hello) Net.seq = p.seq - 1;
+    if (p.seq <= Net.seq) return;
     if (p.kicked || p.closed) {
       const why = p.kicked ? 'You were removed from the room.' : 'The host closed the room.';
       const cb = Net.onClosed;

@@ -308,8 +308,8 @@ async function main() {
 
   await t('SSE: start and actions push state with rising seq', async () => {
     await post(`/api/rooms/${g3.code}/start`, { token: g3.alice, epidemics: 4 });
-    const started = await g3.es.next();
-    assert.equal(started.status, 'playing');
+    let started = await g3.es.next(); // drain lobby-era frames (hello + roster)
+    while (started.status !== 'playing') started = await g3.es.next();
     assert.ok(started.state);
     await post(`/api/rooms/${g3.code}/action`, { token: g3.alice, fn: 'pass', args: [] });
     const acted = await g3.es.next();
@@ -372,6 +372,17 @@ async function main() {
     es.close();
     const self = await post(`/api/rooms/${c.body.code}/kick`, { token: c.body.token, seat: 0 });
     assert.equal(self.status, 400); // host cannot kick themselves
+  });
+
+  // ---- SSE hello: reconnects must resync even if seq went backwards ----
+  await t('first SSE frame is a hello snapshot', async () => {
+    const c = await post('/api/rooms', { name: 'Solo' });
+    const es = sseOpen(`/api/rooms/${c.body.code}/events?token=${c.body.token}`);
+    const ev = await es.next();
+    assert.equal(ev.hello, true);
+    assert.equal(ev.mySeat, 0);
+    assert.ok(ev.seq >= 1);
+    es.close();
   });
 
   // ---- persistence ----
