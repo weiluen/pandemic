@@ -116,10 +116,13 @@
     Net.seq = p.seq;
     Net.status = p.status; Net.seats = p.seats; Net.seat = p.mySeat;
     Net.forecastBy = p.forecastBy; Net.undoDepth = p.undoDepth;
+    // Game.load replaces the engine's state object; `prev` keeps the old one
+    // alive so the UI can replay animations that need before/after (origins,
+    // removed-cube counts).
     const prev = Game.state();
     const prevLogLen = prev && p.state ? prev.log.length : -1;
     if (p.state) Game.load(p.state);
-    if (Net.onUpdate) Net.onUpdate(p, prevLogLen);
+    if (Net.onUpdate) Net.onUpdate(p, prevLogLen, prev);
   };
 
   Net.leave = function () {

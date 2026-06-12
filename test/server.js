@@ -315,6 +315,7 @@ async function main() {
     const acted = await g3.es.next();
     assert.ok(acted.seq > started.seq);
     assert.equal(acted.actorSeat, 0);
+    assert.equal(acted.action.fn, 'pass'); // remote clients replay this
     assert.equal(JSON.parse(acted.state).phase, 'draw');
   });
 

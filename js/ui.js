@@ -2134,14 +2134,103 @@
 
   // Online: every applied server payload lands here (from SSE or a POST echo).
   // Routes between lobby and board, then replays other players' action beats.
-  Net.onUpdate = (p, prevLogLen) => {
+  Net.onUpdate = (p, prevLogLen, prev) => {
     if (!Net.online) return;
     if (Net.status === 'lobby') { showLobby(); return; }
     $('#setup').hidden = true;
     $('#app').hidden = false;
     refresh();
-    if (p && p.state && prevLogLen >= 0 && p.actorSeat !== Net.seat) animateRemote(prevLogLen);
+    if (p && p.state && prevLogLen >= 0 && p.actorSeat !== Net.seat) {
+      if (p.action) replayAction(p.action, p.actorSeat, prev, prevLogLen);
+      else animateRemote(prevLogLen); // resync/catch-up frames carry no action
+    }
   };
+
+  // Replay another player's action with the SAME animations, sounds and camera
+  // moves their own screen showed. The server ships {fn, args, ret} with every
+  // action broadcast; `prev` is the state before this action (for origins and
+  // before/after counts). Pure flavor — wrapped so it can never break sync.
+  function replayAction(a, actorSeat, prev, logMark) {
+    try {
+      const g = G();
+      const actor = g.players[actorSeat] || g.players[g.current];
+      const zoomTo = (city, w) => {
+        const c = Game.CITY[city];
+        if (c) animateViewTo(c.x, c.y, Math.min(view.w, w));
+      };
+      switch (a.fn) {
+        case 'performMove': {
+          const [pawnIdx, type, dest] = a.args;
+          const from = prev && prev.players[pawnIdx] ? prev.players[pawnIdx].location : null;
+          sfx('move');
+          cityPulse(dest, '#38bdf8');
+          if (from && from !== dest) {
+            if (type === 'drive') animateDrive(from, dest);
+            else animateFlight(from, dest);
+          }
+          zoomTo(dest, 980);
+          break;
+        }
+        case 'treat': {
+          const loc = actor.location, color = a.args[0];
+          sfx('treat');
+          cityPulse(loc, '#4ade80');
+          if (prev) {
+            const removed = prev.cityCubes[loc][color] - g.cityCubes[loc][color];
+            if (removed > 0) floatText(loc, `−${removed} ${color}`, HEX[color]);
+          }
+          zoomTo(loc, 1000);
+          break;
+        }
+        case 'build':
+          sfx('build');
+          cityPulse(actor.location, '#f8fafc');
+          break;
+        case 'discoverCure':
+          sfx('cure');
+          cureBanner(a.args[0]);
+          break;
+        case 'shareKnowledge': sfx('share'); break;
+        case 'contingencyTake': sfx('event'); break;
+        case 'drawPlayerCard':
+          if (a.ret) {
+            sfx(a.ret.type === 'epidemic' ? 'epidemic' : 'draw');
+            animatePlayerDraw(a.ret); // postcard / event flip / epidemic + epicenter
+          }
+          animateOutbreaks(logMark);
+          break;
+        case 'flipInfectionCard':
+          if (a.ret) {
+            sfx('infect');
+            animateInfection(a.ret); // flying chip + zoom to the struck city
+          }
+          animateOutbreaks(logMark);
+          break;
+        case 'intensify': sfx('draw'); break;
+        case 'playEvent': {
+          const name = a.args[2], params = a.args[3] || {};
+          sfx('event');
+          if (name === 'Airlift' && params.city != null) {
+            const from = prev && prev.players[params.pawnIdx] ? prev.players[params.pawnIdx].location : null;
+            cityPulse(params.city, '#4ade80');
+            if (from && from !== params.city) animateFlight(from, params.city);
+          } else if (name === 'Government Grant' && params.city) {
+            cityPulse(params.city, '#f8fafc');
+          } else if (name === 'Resilient Population' && prev) {
+            const card = prev.infectionDiscard[params.discardIdx];
+            if (card) cityPulse(card.city, '#4ade80');
+          }
+          animateOutbreaks(logMark);
+          break;
+        }
+        case 'pass': case 'forecastCommit': case 'discardForLimit': case 'undo':
+          sfx('click');
+          break;
+        default:
+          animateRemote(logMark);
+      }
+    } catch (e) { /* flavor only — never interrupt state sync */ }
+  }
 
   // Replay the visual beats of someone else's action from the log entries the
   // new state added. Pure flavor — never touches game state. The 25-entry cap

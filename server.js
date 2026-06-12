@@ -96,7 +96,10 @@ function payload(room, seat, actorSeat) {
   };
 }
 
-function broadcast(room, actorSeat) {
+// `action` ({fn, args, ret}) rides along on action-triggered broadcasts so
+// remote clients can replay the actor's animations exactly (drawn card,
+// flight path, camera zoom). Transient — never persisted, never on hellos.
+function broadcast(room, actorSeat, action) {
   room.seq++;
   for (const c of room.sseClients.slice()) {
     const seat = seatByToken(room, c.token);
@@ -107,7 +110,7 @@ function broadcast(room, actorSeat) {
       room.sseClients = room.sseClients.filter(x => x !== c);
       continue;
     }
-    c.res.write(`data: ${JSON.stringify(payload(room, seat, actorSeat))}\n\n`);
+    c.res.write(`data: ${JSON.stringify({ ...payload(room, seat, actorSeat), action: action || null })}\n\n`);
   }
   scheduleSave();
 }
@@ -370,7 +373,7 @@ async function apiRooms(req, res, url, code, sub) {
     const out = applyAction(room, seat, body.fn, args);
     if (out.error) return sendJSON(res, 400, { error: out.error });
     touch(room);
-    broadcast(room, seat);
+    broadcast(room, seat, { fn: body.fn, args, ret: out.ret });
     return sendJSON(res, 200, { ok: true, ret: out.ret, room: payload(room, seat, seat) });
   }
 
@@ -416,7 +419,7 @@ async function apiRooms(req, res, url, code, sub) {
     if (!room.turnSnapshots.length) return sendJSON(res, 400, { error: 'nothing to undo' });
     room.state = room.turnSnapshots.pop();
     touch(room);
-    broadcast(room, seat);
+    broadcast(room, seat, { fn: 'undo', args: [], ret: null });
     return sendJSON(res, 200, { ok: true, room: payload(room, seat, seat) });
   }
 
