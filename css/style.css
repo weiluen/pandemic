@@ -98,6 +98,14 @@ main { display: flex; flex: 1; min-height: 0; }
 .pulse { animation: pulse 1.6s infinite; }
 @keyframes pulse { 0%,100% { opacity: 0.9; } 50% { opacity: 0.25; } }
 
+/* ---------- Pawns & research stations ---------- */
+.pawnicon { filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.7)); }
+.pawnicon.me { filter: drop-shadow(0 0 7px #38bdf8) drop-shadow(0 2px 3px rgba(0, 0, 0, 0.7)); }
+.pawnhalo { pointer-events: none; animation: pulse 1.6s infinite; }
+.station .stationglow { pointer-events: none; animation: stationpulse 2.8s ease-in-out infinite; }
+@keyframes stationpulse { 0%, 100% { opacity: 0.9; } 50% { opacity: 0.45; } }
+.stationicon { filter: drop-shadow(0 0 6px rgba(56, 189, 248, 0.8)); }
+
 /* ---------- Infection flip animation ---------- */
 .infectflip {
   position: absolute; top: 54px; left: 50%; z-index: 28; pointer-events: none;
@@ -169,6 +177,20 @@ main { display: flex; flex: 1; min-height: 0; }
   filter: drop-shadow(0 0 4px var(--accent));
 }
 .planetrail.fade { transition: opacity 0.6s ease-out; opacity: 0; }
+.drivetrail {
+  stroke: #cbd5e1; stroke-width: 2; stroke-linecap: round;
+  stroke-dasharray: 1 7; opacity: 0.55; pointer-events: none;
+}
+.drivetrail.fade { transition: opacity 0.6s ease-out; opacity: 0; }
+.caricon {
+  fill: #fcd34d; pointer-events: none;
+  filter: drop-shadow(0 0 4px rgba(252, 211, 77, 0.7)) drop-shadow(0 1px 1px rgba(0,0,0,0.6));
+}
+.drivetrail.wake { stroke: #7dd3fc; stroke-dasharray: 6 6; opacity: 0.5; }
+.boaticon {
+  fill: #e2e8f0; pointer-events: none;
+  filter: drop-shadow(0 0 4px rgba(125, 211, 252, 0.8)) drop-shadow(0 1px 1px rgba(0,0,0,0.6));
+}
 .planeicon {
   fill: #f1f6ff; pointer-events: none;
   filter: drop-shadow(0 0 5px var(--accent)) drop-shadow(0 1px 1px rgba(0,0,0,0.6));
@@ -431,6 +453,28 @@ button:active:not(:disabled) { transform: scale(0.94); }
   border-left: 2px solid #e2c08d; border-radius: 0 4px 4px 0;
 }
 
+/* ---------- News ticker ---------- */
+#ticker {
+  display: flex; align-items: center; flex-shrink: 0; height: 34px;
+  background: #0d1526; border-bottom: 1px solid var(--line);
+}
+.tickertag {
+  flex-shrink: 0; display: flex; align-items: center; height: 100%; padding: 0 12px;
+  font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase;
+  color: #0b1220; background: #e2c08d;
+}
+#tickerwrap {
+  flex: 1; position: relative; height: 100%; overflow: hidden;
+  mask-image: linear-gradient(90deg, transparent, #000 18px, #000 calc(100% - 18px), transparent);
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 18px, #000 calc(100% - 18px), transparent);
+}
+#tickertrack {
+  position: absolute; left: 0; top: 0; height: 100%;
+  display: flex; align-items: center; white-space: nowrap; will-change: transform;
+}
+.tickeritem { display: inline-flex; align-items: center; color: #e2c08d; font-style: italic; font-size: 13px; }
+.tickeritem .tickersep { color: var(--accent); font-style: normal; margin: 0 16px; opacity: 0.7; }
+
 /* ---------- Modals ---------- */
 #modal, #stateModal, #setup {
   position: fixed; inset: 0; z-index: 50;
@@ -484,3 +528,12 @@ button:active:not(:disabled) { transform: scale(0.94); }
 .gameover h2 { font-size: 26px; }
 .gameover h2.win { color: var(--good); }
 .gameover h2.loss { color: var(--bad); }
+
+/* ---- online lobby & connection ---- */
+.connDot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.roomcode { display: flex; gap: 8px; justify-content: center; margin: 10px 0 16px; }
+.roomcode span {
+  font-size: 34px; font-weight: 800; letter-spacing: 1px;
+  background: #0b1220; border: 1px solid #2b3a55; border-radius: 10px;
+  padding: 6px 14px; color: var(--accent, #38bdf8);
+}

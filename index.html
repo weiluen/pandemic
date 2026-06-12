@@ -3,12 +3,16 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pandemic — Local Two-Player</title>
+<title>Pandemic</title>
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
 <div id="app" hidden>
   <header id="topbar"></header>
+  <div id="ticker" hidden>
+    <span class="tickertag">📰 World News</span>
+    <div id="tickerwrap"><div id="tickertrack"></div></div>
+  </div>
   <main>
     <div id="mapwrap">
       <svg id="map" viewBox="0 0 1500 780" preserveAspectRatio="xMidYMid meet"></svg>
@@ -44,19 +48,26 @@ if (!globalThis.Game || !globalThis.PANDEMIC_DATA) {
   throw new Error('scripts missing');
 }
 </script>
+<script src="js/net.js"></script>
+<script src="js/ai.js"></script>
 <script src="js/ui.js"></script>
 <script>
 // Dev live-reload: poll source files and refresh when they change (localhost only).
 // Safe mid-game: state autosaves after every action and auto-resumes on load.
 if (['localhost', '127.0.0.1'].includes(location.hostname)) {
-  const files = ['index.html', 'css/style.css', 'js/data.js', 'js/game.js', 'js/ui.js', 'js/worldmap.js'];
+  const files = ['index.html', 'css/style.css', 'js/data.js', 'js/game.js', 'js/net.js', 'js/ai.js', 'js/ui.js', 'js/worldmap.js'];
   let sig = null;
   setInterval(async () => {
     try {
       const parts = await Promise.all(files.map(f =>
         fetch(f, { method: 'HEAD', cache: 'no-store' }).then(r => r.headers.get('last-modified'))));
       const s = parts.join('|');
-      if (sig && s !== sig) location.reload();
+      if (sig && s !== sig) {
+        // Refresh the HTTP cache first: http.server only sends Last-Modified,
+        // so a plain reload can run stale heuristically-cached scripts.
+        await Promise.all(files.map(f => fetch(f, { cache: 'reload' }).catch(() => {})));
+        location.reload();
+      }
       sig = s;
     } catch (e) { /* server restarting; retry next tick */ }
   }, 1500);

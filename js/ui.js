@@ -43,6 +43,9 @@
 
   const $ = s => document.querySelector(s);
   const G = () => Game.state();
+  // Online: you are exactly one seat. Local hotseat: you are whoever's turn it is.
+  const myTurn = () => !Net.online || Net.seat === G().current;
+  const mySeatIs = i => !Net.online || Net.seat === i;
 
   function el(tag, attrs, ...kids) {
     const n = document.createElement(tag);
@@ -136,22 +139,38 @@
     toastTimer = setTimeout(() => { t.hidden = true; }, 3200);
   }
 
-  // run engine call with error toast; both return whether the call succeeded
+  // Dispatch a mutating engine call by name. Local mode: synchronous, exactly
+  // the pre-multiplayer behavior (undo snapshot for `act`, toast on throw).
+  // Online mode: POST to the server; the echoed payload updates the mirrored
+  // state before the promise resolves. Always returns a Promise of {ok, ret}
   // so call sites can fire sounds/animations only on success.
-  function run(fn) {
-    let ok = false;
-    try { fn(); ok = true; } catch (e) { toast(e.message.replace(/^Illegal: /, '')); sfx('error'); }
-    refresh();
-    return ok;
+  async function dispatch(fn, args, undoable) {
+    if (!globalThis.Net || !Net.online) {
+      const snap = undoable ? Game.snapshot() : null;
+      let ok = false, ret;
+      try {
+        ret = Game[fn](...args);
+        if (undoable) ui.undoStack.push(snap);
+        ok = true;
+      } catch (e) { toast(e.message.replace(/^Illegal: /, '')); sfx('error'); }
+      if (undoable) ui.selectedCity = null;
+      refresh();
+      return { ok, ret };
+    }
+    try {
+      const j = await Net.action(fn, args);
+      if (undoable) ui.selectedCity = null;
+      Net.applyPayload(j.room); // no-op if the SSE echo of this action won the race
+      refresh();                // re-render regardless, so cleared selection sticks
+      return { ok: true, ret: j.ret };
+    } catch (e) {
+      toast(e.message); sfx('error');
+      refresh();
+      return { ok: false };
+    }
   }
-  function act(fn) {
-    const snap = Game.snapshot();
-    let ok = false;
-    try { fn(); ui.undoStack.push(snap); ok = true; } catch (e) { toast(e.message.replace(/^Illegal: /, '')); sfx('error'); }
-    ui.selectedCity = null;
-    refresh();
-    return ok;
-  }
+  const act = (fn, args) => dispatch(fn, args, true);
+  const run = (fn, args) => dispatch(fn, args, false);
 
   // Expanding rings at a city — feedback for actions that land on the map.
   function cityPulse(city, color) {
@@ -207,6 +226,7 @@
   }
 
   function save() {
+    if (globalThis.Net && Net.online) return; // online games live on the server
     if (G() && !G().result) localStorage.setItem(SAVE_KEY, Game.serialize());
     else localStorage.removeItem(SAVE_KEY);
   }
@@ -231,9 +251,15 @@
     function renderPlayerRows() {
       nameInputs.innerHTML = ''; roleSelects.innerHTML = '';
       for (let i = 0; i < count; i++) {
+        const ctrl = el('select', { id: `pctrl${i}`, style: 'margin-left:6px' },
+          el('option', { value: '' }, '👤 Human'),
+          el('option', { value: 'novice' }, '🤖 AI — Novice'),
+          el('option', { value: 'competent' }, '🤖 AI — Competent'),
+          el('option', { value: 'expert' }, '🤖 AI — Expert'));
         nameInputs.append(el('div', { class: 'setuprow' },
           el('label', {}, `Player ${i + 1} name`),
-          el('input', { type: 'text', id: `pname${i}`, value: `Player ${i + 1}` })));
+          el('input', { type: 'text', id: `pname${i}`, value: `Player ${i + 1}` }),
+          ctrl));
         const sel = el('select', { id: `prole${i}` }, el('option', { value: '' }, 'Random role'));
         for (const r of D.roles) sel.append(el('option', { value: r.name }, r.name));
         const desc = el('div', { class: 'setupdesc' });
@@ -277,10 +303,15 @@
           class: 'primary', onclick: () => {
             showErr('');
             try {
-              const names = [], roles = [];
+              const names = [], roles = [], ais = [];
               for (let i = 0; i < count; i++) {
-                names.push($(`#pname${i}`).value.trim() || `Player ${i + 1}`);
+                const ai = $(`#pctrl${i}`).value || null;
+                const fallback = ai ? `Bot ${i + 1}` : `Player ${i + 1}`;
+                let nm = $(`#pname${i}`).value.trim() || fallback;
+                if (ai && nm === `Player ${i + 1}`) nm = fallback; // untouched default → bot name
+                names.push(nm);
                 roles.push($(`#prole${i}`).value);
+                ais.push(ai);
               }
               const chosen = roles.filter(Boolean);
               if (new Set(chosen).size !== chosen.length) {
@@ -293,7 +324,7 @@
                 for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
                 for (let i = 0; i < count; i++) if (!roles[i]) roles[i] = pool.pop();
               }
-              Game.newGame({ names, epidemics: +epiSel.value, roles: chosen.length ? roles : null });
+              Game.newGame({ names, epidemics: +epiSel.value, roles: chosen.length ? roles : null, ais });
               ui.undoStack = [];
               ui.resultPlayed = false;
               ui.turnKey = null;
@@ -307,6 +338,97 @@
         }, 'Start Game')),
     );
     box.append(dlg);
+
+    // Online play: only offered when the page is served by server.js.
+    Net.detect().then(up => {
+      if (!up) return;
+      const odlg = el('div', { class: 'dialog', style: 'margin-top:14px' });
+      odlg.append(el('p', { class: 'boxtitle' }, '🌐 Play online'));
+      odlg.append(el('p', { class: 'sub' }, 'Host a room and share its 4-letter code, or join a friend’s room. Everyone plays from their own computer.'));
+      const nameIn = el('input', { type: 'text', id: 'onlinename', placeholder: 'Your name', value: localStorage.getItem('pandemic-name') || '' });
+      odlg.append(el('div', { class: 'setuprow' }, el('label', {}, 'Name'), nameIn));
+      const codeIn = el('input', { type: 'text', id: 'joincode', placeholder: 'CODE', maxlength: 4, style: 'text-transform:uppercase;width:90px' });
+      const oerr = el('div', { style: 'color:var(--bad);font-weight:600;min-height:18px;margin-top:6px' });
+      const myName = () => {
+        const n = nameIn.value.trim();
+        if (n) localStorage.setItem('pandemic-name', n);
+        return n;
+      };
+      odlg.append(el('div', { class: 'btnrow', style: 'justify-content:flex-start' },
+        el('button', {
+          class: 'primary', onclick: async () => {
+            try { await Net.create(myName()); } catch (e) { oerr.textContent = e.message; }
+          },
+        }, 'Create Room'),
+        el('span', { style: 'margin-left:14px' }),
+        codeIn,
+        el('button', {
+          onclick: async () => {
+            try { await Net.join(codeIn.value, myName()); } catch (e) { oerr.textContent = e.message; }
+          },
+        }, 'Join Room')));
+      odlg.append(oerr);
+      dlg.append(odlg);
+    });
+  }
+
+  // Online lobby: roster fills in live via SSE; the host configures and starts.
+  function showLobby() {
+    const box = $('#setup');
+    box.hidden = false;
+    box.innerHTML = '';
+    $('#app').hidden = true;
+    const isHost = Net.seats.length && Net.seat === 0;
+    const dlg = el('div', { class: 'dialog' });
+    dlg.append(el('p', { class: 'bigtitle' }, 'PANDEMIC'));
+    dlg.append(el('p', { class: 'subtitle' }, 'Online lobby — share the room code. The game starts for everyone at once.'));
+    dlg.append(el('div', { class: 'roomcode' }, ...Net.code.split('').map(ch => el('span', {}, ch))));
+
+    const list = el('div');
+    Net.seats.forEach((s, i) => {
+      list.append(el('div', { class: 'setuprow' },
+        el('span', { class: 'connDot', style: `background:${s.connected ? 'var(--good)' : 'var(--bad)'}` }),
+        el('label', {}, `${i + 1}. ${s.name}${i === 0 ? ' (host)' : ''}${i === Net.seat ? ' — you' : ''}`)));
+    });
+    for (let i = Net.seats.length; i < 4; i++) {
+      list.append(el('div', { class: 'setuprow', style: 'opacity:.45' },
+        el('span', { class: 'connDot', style: 'background:var(--dim)' }),
+        el('label', {}, `${i + 1}. waiting for a player…`)));
+    }
+    dlg.append(list);
+
+    const errLine = el('div', { style: 'color:var(--bad);font-weight:600;min-height:18px;margin-top:8px' });
+    if (isHost) {
+      const epiSel = el('select', {},
+        el('option', { value: 4 }, '4 epidemics — Introductory'),
+        el('option', { value: 5 }, '5 epidemics — Standard'),
+        el('option', { value: 6 }, '6 epidemics — Heroic'));
+      epiSel.value = String(ui.lobbyEpidemics || 4);
+      epiSel.onchange = () => { ui.lobbyEpidemics = +epiSel.value; };
+      dlg.append(el('div', { class: 'setuprow' }, el('label', {}, 'Difficulty'), epiSel));
+      dlg.append(errLine);
+      dlg.append(el('div', { class: 'btnrow' },
+        el('button', { onclick: leaveOnline }, 'Leave'),
+        el('button', {
+          class: 'primary', disabled: Net.seats.length < 2,
+          onclick: async () => {
+            try { await Net.start(+epiSel.value, null); } catch (e) { errLine.textContent = e.message; }
+          },
+        }, Net.seats.length < 2 ? 'Waiting for players…' : 'Start Game')));
+    } else {
+      dlg.append(errLine);
+      dlg.append(el('div', { class: 'btnrow' },
+        el('button', { onclick: leaveOnline }, 'Leave'),
+        el('span', { class: 'sub', style: 'align-self:center' }, 'Waiting for the host to start…')));
+    }
+    box.append(dlg);
+  }
+
+  function leaveOnline() {
+    Net.leave();
+    $('#app').hidden = true;
+    ui.turnKey = null;
+    showSetup();
   }
 
   // On-demand viewer for the infection discard pile (public knowledge in Pandemic).
@@ -388,6 +510,15 @@
       class: 'stat statbtn', title: 'Click to inspect the infection discard pile',
       onclick: showInfectionPile,
     }, 'Infection deck', el('b', {}, ` ${g.infectionDeck.length}`), el('span', { class: 'peek' }, '🔍')));
+    if (Net.online) {
+      const offline = Net.seats.filter(s => !s.connected).map(s => s.name);
+      bar.append(el('span', {
+        class: 'stat',
+        title: Net.sseUp ? (offline.length ? `Disconnected: ${offline.join(', ')}` : 'Connected') : 'Reconnecting…',
+      }, `Room ${Net.code}`,
+        el('span', { class: 'connDot', style: `margin-left:6px;background:${Net.sseUp ? 'var(--good)' : 'var(--bad)'}` }),
+        offline.length ? el('span', { style: 'color:var(--bad);margin-left:6px' }, `⚠ ${offline.join(', ')}`) : null));
+    }
     bar.append(el('span', { class: 'spacer' }));
     bar.append(el('button', {
       title: muted ? 'Unmute sound effects' : 'Mute sound effects',
@@ -396,16 +527,22 @@
     bar.append(el('button', { onclick: showHelp }, 'Rules'));
     bar.append(el('button', {
       class: 'danger', onclick: () => {
-        openModal('Start a new game?', dlg => {
-          dlg.append(el('p', { class: 'sub' }, 'The current game will be abandoned.'));
+        openModal(Net.online ? 'Leave this game?' : 'Start a new game?', dlg => {
+          dlg.append(el('p', { class: 'sub' }, Net.online
+            ? 'You can rejoin with the room code as long as the game is running.'
+            : 'The current game will be abandoned.'));
           dlg.append(el('div', { class: 'btnrow' },
             el('button', { onclick: closeModal }, 'Cancel'),
             el('button', {
-              class: 'primary', onclick: () => { closeModal(); localStorage.removeItem(SAVE_KEY); $('#app').hidden = true; showSetup(); },
-            }, 'New game')));
+              class: 'primary', onclick: () => {
+                closeModal();
+                if (Net.online) { leaveOnline(); return; }
+                localStorage.removeItem(SAVE_KEY); $('#app').hidden = true; showSetup();
+              },
+            }, Net.online ? 'Leave Game' : 'New game')));
         });
       },
-    }, 'New Game'));
+    }, Net.online ? 'Leave Game' : 'New Game'));
   }
 
   // ================= Map view (zoom & pan) =================
@@ -542,6 +679,16 @@
       gl.append(svg('stop', { offset: '100%', 'stop-color': HEX[c], 'stop-opacity': 0 }));
       defs.append(gl);
     }
+    // research-station building face + shared cyan halo (also under the active pawn)
+    const stg = svg('linearGradient', { id: 'stationg', x1: 0, y1: 0, x2: 0, y2: 1 });
+    stg.append(svg('stop', { offset: '0%', 'stop-color': '#ffffff' }));
+    stg.append(svg('stop', { offset: '100%', 'stop-color': '#bfd3ea' }));
+    defs.append(stg);
+    const sgl = svg('radialGradient', { id: 'glow-station' });
+    sgl.append(svg('stop', { offset: '0%', 'stop-color': '#38bdf8', 'stop-opacity': 0.65 }));
+    sgl.append(svg('stop', { offset: '60%', 'stop-color': '#38bdf8', 'stop-opacity': 0.25 }));
+    sgl.append(svg('stop', { offset: '100%', 'stop-color': '#38bdf8', 'stop-opacity': 0 }));
+    defs.append(sgl);
     g.append(defs);
     for (let x = 125; x < BASE_W; x += 125) g.append(svg('line', { class: 'grat', x1: x, y1: 0, x2: x, y2: BASE_H }));
     for (let y = 130; y < BASE_H; y += 130) g.append(svg('line', { class: 'grat', x1: 0, y1: y, x2: BASE_W, y2: y }));
@@ -594,7 +741,7 @@
       }
       // current player's location ring
       if (g.players[g.current].location === c.name && !g.result) {
-        node.append(svg('circle', { class: 'pulse', cx: c.x, cy: c.y, r: 17, fill: 'none', stroke: '#38bdf8', 'stroke-width': 2 }));
+        node.append(svg('circle', { class: 'pulse', cx: c.x, cy: c.y, r: 20, fill: 'none', stroke: '#38bdf8', 'stroke-width': 3 }));
       }
       if (ui.selectedCity === c.name) {
         node.append(svg('circle', { cx: c.x, cy: c.y, r: 15, fill: 'none', stroke: '#ffffff', 'stroke-width': 2 }));
@@ -606,12 +753,21 @@
       node.append(svg('text', { class: 'citylabel', x: c.x, y: c.y + 24, 'text-anchor': 'middle' },
         `${EMOJI[c.name] ? EMOJI[c.name] + ' ' : ''}${c.name}`));
 
-      // research station
+      // research station: a glowing lab building with a medical cross
       if (g.stations.includes(c.name)) {
-        node.append(svg('path', {
-          d: `M ${c.x - 22} ${c.y + 3} h 11 v -8 l -5.5 -5 l -5.5 5 z`,
-          fill: '#f8fafc', stroke: '#0b1220', 'stroke-width': 1,
+        const sx = c.x - 24, sy = c.y - 2;
+        const st = svg('g', { class: 'station' });
+        st.append(svg('circle', { class: 'stationglow', cx: sx, cy: sy, r: 19, fill: 'url(#glow-station)' }));
+        st.append(svg('path', {
+          class: 'stationicon',
+          d: `M ${sx - 9} ${sy + 8} h 18 v -12 l -9 -8 l -9 8 z`,
+          fill: 'url(#stationg)', stroke: '#0e4f7a', 'stroke-width': 1.6, 'stroke-linejoin': 'round',
         }));
+        st.append(svg('path', {
+          d: `M ${sx - 1.8} ${sy - 3} h 3.6 v 3.2 h 3.2 v 3.6 h -3.2 v 3.2 h -3.6 v -3.2 h -3.2 v -3.6 h 3.2 z`,
+          fill: '#0891b2', style: 'pointer-events:none',
+        }));
+        node.append(st);
       }
       // cubes: one badge per color present
       const present = COLORS.filter(col => g.cityCubes[c.name][col] > 0);
@@ -637,13 +793,20 @@
       g.players.forEach((p, i) => {
         if (p.location !== c.name) return;
         const [dx, dy] = offsets[i];
+        const isMe = i === g.current && !g.result;
+        if (isMe) { // halo under the active player's pawn
+          node.append(svg('circle', {
+            class: 'pawnhalo', cx: c.x + dx, cy: c.y + dy, r: 14, fill: 'url(#glow-station)',
+          }));
+        }
         node.append(svg('path', {
-          d: PAWN, transform: `translate(${c.x + dx} ${c.y + dy}) scale(1.15)`,
-          fill: ROLE[p.role].color, stroke: i === g.current ? '#fff' : '#0b1220', 'stroke-width': 1.4,
+          class: 'pawnicon' + (isMe ? ' me' : ''),
+          d: PAWN, transform: `translate(${c.x + dx} ${c.y + dy}) scale(${isMe ? 1.8 : 1.45})`,
+          fill: ROLE[p.role].color, stroke: isMe ? '#fff' : '#0b1220', 'stroke-width': isMe ? 1.7 : 1.4,
           'stroke-linejoin': 'round',
         }));
         node.append(svg('text', {
-          x: c.x + dx, y: c.y + dy + 5.5, 'text-anchor': 'middle', 'font-size': 8, 'font-weight': 800, fill: '#0b1220',
+          x: c.x + dx, y: c.y + dy + 6, 'text-anchor': 'middle', 'font-size': isMe ? 10 : 9, 'font-weight': 800, fill: '#0b1220',
           style: 'pointer-events:none',
         }, i + 1));
       });
@@ -654,7 +817,7 @@
 
   function onCityClick(name, ev) {
     if (ui.selectMode) { const m = ui.selectMode; ui.selectMode = null; m.onPick(name); return; }
-    if (G().phase !== 'actions' || G().result) return;
+    if (G().phase !== 'actions' || G().result || !myTurn()) return;
     const rect = $('#mapwrap').getBoundingClientRect();
     ui.lastCityClick = { px: ev.clientX - rect.left, py: ev.clientY - rect.top };
     ui.selectedCity = ui.selectedCity === name ? null : name;
@@ -666,7 +829,7 @@
     const g = G();
     const menu = $('#citymenu');
     const name = ui.selectedCity;
-    if (!name || g.phase !== 'actions' || g.result) { menu.hidden = true; return; }
+    if (!name || g.phase !== 'actions' || g.result || !myTurn()) { menu.hidden = true; return; }
     menu.hidden = false;
     menu.innerHTML = '';
     const city = Game.CITY[name];
@@ -698,13 +861,14 @@
     }
     for (const o of opts) {
       menu.append(el('button', {
-        onclick: () => {
+        onclick: async () => {
           if (o.type === 'opex') { pickOpexCard(name); return; }
           const from = g.players[pawnIdx].location;
-          if (act(() => Game.performMove(pawnIdx, o.type, name))) {
+          if ((await act('performMove', [pawnIdx, o.type, name])).ok) {
             sfx('move');
             cityPulse(name, '#38bdf8');
-            if (o.type !== 'drive') animateFlight(from, name); // a plane for every flight
+            if (o.type === 'drive') animateDrive(from, name); // a car for the road
+            else animateFlight(from, name); // a plane for every flight
             const cc = Game.CITY[name];
             animateViewTo(cc.x, cc.y, Math.min(view.w, 980)); // glide in on the pawn
           }
@@ -728,10 +892,10 @@
       me.hand.forEach((c, i) => {
         if (c.type !== 'city') return;
         list.append(el('button', {
-          onclick: () => {
+          onclick: async () => {
             closeModal();
             const from = g.players[g.current].location;
-            if (act(() => Game.performMove(g.current, 'opex', dest, i))) {
+            if ((await act('performMove', [g.current, 'opex', dest, i])).ok) {
               sfx('move');
               cityPulse(dest, '#38bdf8');
               animateFlight(from, dest); // operations flight
@@ -777,6 +941,18 @@
     box.append(grid);
     const me = g.players[g.current];
 
+    if (Net.online && !myTurn() && ['actions', 'draw', 'infect', 'epidemicPause'].includes(g.phase)) {
+      grid.append(el('div', { class: 'wide', style: 'grid-column:1/-1;font-size:13px;color:var(--dim)' },
+        `⏳ Waiting for ${me.name} (${me.role})…`));
+      return;
+    }
+
+    if (me.ai && !g.result) {
+      grid.append(el('div', { class: 'wide', style: 'grid-column:1/-1;font-size:13px;color:var(--dim)' },
+        `🤖 ${me.name} (${me.role}, ${me.ai} AI) is thinking…`));
+      return;
+    }
+
     if (g.phase === 'actions') {
       const cubesHere = COLORS.filter(c => g.cityCubes[me.location][c] > 0);
       grid.append(el('button', { disabled: !cubesHere.length, onclick: () => doTreat(cubesHere) }, 'Treat Disease'));
@@ -794,11 +970,18 @@
         }, g.contingency ? `Stored: ${g.contingency}` : 'Retrieve Event Card'));
       }
       grid.append(el('button', {
-        class: 'wide', onclick: () => { if (act(() => Game.pass())) sfx('click'); },
+        class: 'wide', onclick: async () => { if ((await act('pass', [])).ok) sfx('click'); },
       }, `End Actions (forfeit ${g.actionsLeft})`));
       grid.append(el('button', {
-        class: 'wide', disabled: !ui.undoStack.length,
-        onclick: () => { Game.restore(ui.undoStack.pop()); ui.selectedCity = null; sfx('click'); refresh(); },
+        class: 'wide', disabled: Net.online ? !Net.undoDepth : !ui.undoStack.length,
+        onclick: async () => {
+          if (Net.online) {
+            try { const j = await Net.undo(); Net.applyPayload(j.room); refresh(); sfx('click'); }
+            catch (e) { toast(e.message); sfx('error'); }
+          } else {
+            Game.restore(ui.undoStack.pop()); ui.selectedCity = null; sfx('click'); refresh();
+          }
+        },
       }, '↩ Undo Action'));
     } else if (g.phase === 'draw') {
       const drawn = g.lastDrawn.filter(c => c.type !== 'epidemic');
@@ -807,26 +990,24 @@
           'Drawn: ', drawn.map(c => cardChip(c)).flat()));
       }
       grid.append(el('button', {
-        class: 'primary wide', onclick: () => {
-          let card;
+        class: 'primary wide', onclick: async () => {
           const logMark = G().log.length;
-          run(() => { card = Game.drawPlayerCard(); });
-          if (card) {
-            sfx(card.type === 'epidemic' ? 'epidemic' : 'draw');
-            animatePlayerDraw(card);
+          const r = await run('drawPlayerCard', []);
+          if (r.ok && r.ret) {
+            sfx(r.ret.type === 'epidemic' ? 'epidemic' : 'draw');
+            animatePlayerDraw(r.ret);
             animateOutbreaks(logMark);
           }
         },
       }, `Draw Player Card (${g.cardsToDraw} left)`));
     } else if (g.phase === 'infect') {
       grid.append(el('button', {
-        class: 'primary wide', onclick: () => {
-          let card;
+        class: 'primary wide', onclick: async () => {
           const logMark = G().log.length;
-          run(() => { card = Game.flipInfectionCard(); });
-          if (card) {
+          const r = await run('flipInfectionCard', []);
+          if (r.ok && r.ret) {
             sfx('infect');
-            animateInfection(card);
+            animateInfection(r.ret);
             animateOutbreaks(logMark);
           }
         },
@@ -904,14 +1085,14 @@
         if (c.type === 'event') {
           hand.append(cardChip(c, {
             onPlay: () => playEventFlow(i, 'hand', c.event),
-            playDisabled: !Game.canPlayEvent(c.event),
+            playDisabled: !Game.canPlayEvent(c.event) || !mySeatIs(i),
           }));
         } else hand.append(cardChip(c));
       });
       if (p.role === 'Contingency Planner' && g.contingency) {
         hand.append(cardChip({ type: 'event', event: g.contingency }, {
           onPlay: () => playEventFlow(i, 'contingency', g.contingency),
-          playDisabled: !Game.canPlayEvent(g.contingency),
+          playDisabled: !Game.canPlayEvent(g.contingency) || !mySeatIs(i),
         }));
       }
       pc.append(hand);
@@ -949,9 +1130,9 @@
 
   function doTreat(cubesHere) {
     const loc = G().players[G().current].location;
-    const treated = c => {
+    const treated = async c => {
       const before = G().cityCubes[loc][c];
-      if (act(() => Game.treat(c))) {
+      if ((await act('treat', [c])).ok) {
         sfx('treat');
         cityPulse(loc, '#4ade80');
         floatText(loc, `−${before - G().cityCubes[loc][c]} ${c}`, HEX[c]);
@@ -976,7 +1157,9 @@
   function doBuild() {
     const g = G();
     const loc = g.players[g.current].location;
-    const built = from => { if (act(() => Game.build(from))) { sfx('build'); cityPulse(loc, '#f8fafc'); } };
+    const built = async from => {
+      if ((await act('build', from ? [from] : [])).ok) { sfx('build'); cityPulse(loc, '#f8fafc'); }
+    };
     if (g.stations.length < Game.MAX_STATIONS) { built(); return; }
     openModal('Build Research Station', dlg => {
       dlg.append(el('p', { class: 'sub' }, 'All 6 stations are on the board. Choose one to move here.'));
@@ -1014,9 +1197,9 @@
           }
           pickRow.append(el('button', {
             class: 'primary', disabled: selected.size !== need,
-            onclick: () => {
+            onclick: async () => {
               closeModal();
-              if (act(() => Game.discoverCure(color, [...selected]))) {
+              if ((await act('discoverCure', [color, [...selected]])).ok) {
                 sfx('cure');
                 cureBanner(color);
               }
@@ -1057,7 +1240,7 @@
       const list = el('div', { class: 'list' });
       for (const o of options) {
         list.append(el('button', {
-          onclick: () => { closeModal(); if (act(() => Game.shareKnowledge(o.gi, o.ti, o.hi))) sfx('share'); },
+          onclick: async () => { closeModal(); if ((await act('shareKnowledge', [o.gi, o.ti, o.hi])).ok) sfx('share'); },
         }, o.label));
       }
       dlg.append(list, el('div', { class: 'btnrow' }, el('button', { onclick: closeModal }, 'Cancel')));
@@ -1071,7 +1254,7 @@
       const list = el('div', { class: 'list' });
       for (const c of g.playerDiscard.filter(c => c.type === 'event')) {
         list.append(el('button', {
-          onclick: () => { closeModal(); if (act(() => Game.contingencyTake(c.event))) sfx('event'); },
+          onclick: async () => { closeModal(); if ((await act('contingencyTake', [c.event])).ok) sfx('event'); },
         }, `${c.event} — ${EVENT[c.event].desc}`));
       }
       dlg.append(list, el('div', { class: 'btnrow' }, el('button', { onclick: closeModal }, 'Cancel')));
@@ -1080,24 +1263,24 @@
 
   // ================= Event flows =================
 
-  function playEventFlow(playerIdx, source, name) {
+  async function playEventFlow(playerIdx, source, name) {
     const g = G();
     if (!Game.canPlayEvent(name)) { toast('That event cannot be played right now.'); return; }
     ui.undoStack = []; // events can be played by either player; keep undo simple & honest
     closeModal();
 
     if (name === 'One Quiet Night') {
-      if (run(() => Game.playEvent(playerIdx, source, name, {}))) sfx('event');
+      if ((await run('playEvent', [playerIdx, source, name, {}])).ok) sfx('event');
     } else if (name === 'Forecast') {
       ui.forecastOrder = null; // must be cleared BEFORE run(): refresh() seeds it from the new forecast
-      if (run(() => Game.playEvent(playerIdx, source, name, {}))) sfx('event');
+      if ((await run('playEvent', [playerIdx, source, name, {}])).ok) sfx('event');
     } else if (name === 'Resilient Population') {
       openModal('Resilient Population', dlg => {
         dlg.append(el('p', { class: 'sub' }, 'Remove one card from the infection discard pile — that city can never be drawn again (until reshuffled cards run out).'));
         const list = el('div', { class: 'list' });
         g.infectionDiscard.forEach((c, i) => {
           list.append(el('button', {
-            onclick: () => { closeModal(); if (run(() => Game.playEvent(playerIdx, source, name, { discardIdx: i }))) { sfx('event'); cityPulse(c.city, '#4ade80'); } },
+            onclick: async () => { closeModal(); if ((await run('playEvent', [playerIdx, source, name, { discardIdx: i }])).ok) { sfx('event'); cityPulse(c.city, '#4ade80'); } },
           }, `Remove ${EMOJI[c.city] ? EMOJI[c.city] + ' ' : ''}${c.city} (${c.color})`));
         });
         if (g.infectionDiscard.length) dlg.append(list);
@@ -1112,9 +1295,9 @@
           list.append(el('button', {
             onclick: () => {
               closeModal();
-              startSelectMode(`Airlift: click a destination for ${p.name}`, city => {
+              startSelectMode(`Airlift: click a destination for ${p.name}`, async city => {
                 const from = G().players[i].location;
-                if (run(() => Game.playEvent(playerIdx, source, name, { pawnIdx: i, city }))) { sfx('event'); cityPulse(city, '#4ade80'); animateFlight(from, city); }
+                if ((await run('playEvent', [playerIdx, source, name, { pawnIdx: i, city }])).ok) { sfx('event'); cityPulse(city, '#4ade80'); animateFlight(from, city); }
               });
             },
           }, `${p.name} (${p.role}) — currently in ${p.location}`));
@@ -1122,7 +1305,7 @@
         dlg.append(list, el('div', { class: 'btnrow' }, el('button', { onclick: closeModal }, 'Cancel')));
       });
     } else if (name === 'Government Grant') {
-      startSelectMode('Government Grant: click a city to build a research station', city => {
+      startSelectMode('Government Grant: click a city to build a research station', async city => {
         const g2 = G();
         if (g2.stations.includes(city)) { toast('A station is already there.'); refresh(); return; }
         if (g2.stations.length >= Game.MAX_STATIONS) {
@@ -1131,13 +1314,13 @@
             const list = el('div', { class: 'list' });
             for (const s of g2.stations) {
               list.append(el('button', {
-                onclick: () => { closeModal(); if (run(() => Game.playEvent(playerIdx, source, name, { city, relocateFrom: s }))) { sfx('event'); cityPulse(city, '#f8fafc'); } },
+                onclick: async () => { closeModal(); if ((await run('playEvent', [playerIdx, source, name, { city, relocateFrom: s }])).ok) { sfx('event'); cityPulse(city, '#f8fafc'); } },
               }, `Move station from ${s}`));
             }
             dlg.append(list, el('div', { class: 'btnrow' }, el('button', { onclick: closeModal }, 'Cancel')));
           });
         } else {
-          if (run(() => Game.playEvent(playerIdx, source, name, { city }))) { sfx('event'); cityPulse(city, '#f8fafc'); }
+          if ((await run('playEvent', [playerIdx, source, name, { city }])).ok) { sfx('event'); cityPulse(city, '#f8fafc'); }
         }
       });
     }
@@ -1149,7 +1332,7 @@
     $('#mapwrap').querySelectorAll('.turnbanner').forEach(n => n.remove());
     const b = el('div', { class: 'turnbanner' },
       el('span', { class: 'rolechip', style: `background:${ROLE[me.role].color}` }, me.role),
-      el('span', {}, `${me.name}'s turn`));
+      el('span', {}, Net.online && Net.seat === g.current ? 'Your turn' : `${me.name}'s turn`));
     $('#mapwrap').append(b);
     sfx('turn');
     setTimeout(() => b.remove(), 2100);
@@ -1300,6 +1483,81 @@
     })(t0);
   }
 
+  // A compact car silhouette pointing along +x, centered on the origin.
+  const CAR_PATH = 'M13,3 L13,0 Q13,-2 10,-2 L6,-2 L3,-6 L-5,-6 L-8,-2 L-11,-2 Q-13,-2 -13,0 L-13,3 Z ' +
+    'M-7,0.4 a2.6,2.6 0 1,0 0.001,5.2 Z M7,0.4 a2.6,2.6 0 1,0 0.001,5.2 Z';
+  // A little ferry pointing along +x: hull, cabin, and funnel.
+  const BOAT_PATH = 'M-14,1 L14,1 L9,7 L-10,7 Z M-7,1 L-7,-4 L5,-4 L5,1 Z M-2,-4 L-2,-8 L1,-8 L1,-4 Z';
+
+  // Is this board point over land? Tests the generated coastline polygons that
+  // worldLayer() renders, in the same board coordinate space the cities use.
+  let landPaths = null;
+  function overLand(x, y) {
+    if (!landPaths || !landPaths[0] || !landPaths[0].isConnected) {
+      landPaths = [...document.querySelectorAll('#map .world .land')];
+    }
+    const pt = $('#map').createSVGPoint();
+    pt.x = x; pt.y = y;
+    return landPaths.some(p => p.isPointInFill(pt));
+  }
+
+  const WRAP_EDGE = new Set(D.wrapEdges.map(([a, b]) => [a, b].sort().join('|')));
+
+  // Drive vs ferry: a route is a ferry when it wraps around the Pacific or a
+  // meaningful stretch of the straight line between the cities is open water.
+  function isFerryRoute(fromCity, toCity) {
+    if (WRAP_EDGE.has([fromCity, toCity].sort().join('|'))) return true;
+    const a = Game.CITY[fromCity], b = Game.CITY[toCity];
+    let water = 0;
+    for (let i = 1; i <= 7; i++) {
+      const t = i / 8;
+      if (!overLand(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)) water++;
+    }
+    return water >= 3;
+  }
+
+  // A little car putters down the road between adjacent cities (or a ferry
+  // chugs across the water), leaving brief tracks/wake. Pure flourish for
+  // drive/ferry moves; never touches game state.
+  function animateDrive(fromCity, toCity) {
+    const a = Game.CITY[fromCity], b = Game.CITY[toCity];
+    if (!a || !b || (a.x === b.x && a.y === b.y)) return;
+    const ferry = isFerryRoute(fromCity, toCity);
+    const map = $('#map');
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    const deg = Math.atan2(dy, dx) * 180 / Math.PI;
+    // mirror instead of rotating past vertical, so it never travels on its roof
+    const heading = dx < 0 ? `rotate(${deg - 180}) scale(-1,1)` : `rotate(${deg})`;
+
+    const road = svg('line', {
+      class: ferry ? 'drivetrail wake' : 'drivetrail',
+      x1: a.x, y1: a.y, x2: b.x, y2: b.y,
+    });
+    map.append(road);
+    const vehicle = svg('path', {
+      class: ferry ? 'boaticon' : 'caricon',
+      d: ferry ? BOAT_PATH : CAR_PATH,
+    });
+    map.append(vehicle);
+
+    const dur = Math.max(550, Math.min(1500, dist * 3.2));
+    const t0 = performance.now();
+    (function step(now) {
+      const t = Math.min(1, (now - t0) / dur);
+      // cars jitter on a bumpy road; boats ride a slow swell and roll a little
+      const bob = ferry ? Math.sin(t * Math.PI * 3) * 1.4 : Math.sin(t * Math.PI * 8) * 0.9;
+      const roll = ferry ? ` rotate(${Math.sin(t * Math.PI * 4) * 4})` : '';
+      vehicle.setAttribute('transform', `translate(${a.x + dx * t},${a.y + dy * t + bob}) ${heading}${roll}`);
+      if (t < 1 && vehicle.isConnected) requestAnimationFrame(step);
+      else {
+        vehicle.remove();
+        road.classList.add('fade');
+        setTimeout(() => road.remove(), 700);
+      }
+    })(t0);
+  }
+
   // Outbreak at a city: zoom in, shake, detonate, then send the disease down
   // each edge to its neighbors ONE BY ONE so the spread can be watched.
   // Returns the total duration so chained outbreaks can queue up after it.
@@ -1433,7 +1691,12 @@
       stats.append(el('div', { class: 'gostat' }, el('b', {}, `${COLORS.filter(c => g.cures[c]).length}/4`), 'cures found'));
       dlg.append(stats);
       dlg.append(el('div', { class: 'btnrow', style: 'justify-content:center' },
-        el('button', { class: 'primary', onclick: () => { localStorage.removeItem(SAVE_KEY); $('#app').hidden = true; showSetup(); } }, 'New Game')));
+        el('button', {
+          class: 'primary', onclick: () => {
+            if (Net.online) { leaveOnline(); return; }
+            localStorage.removeItem(SAVE_KEY); $('#app').hidden = true; showSetup();
+          },
+        }, Net.online ? 'Leave Room' : 'New Game')));
       box.append(dlg);
       if (g.result.win) {
         const palette = [HEX.blue, HEX.yellow, HEX.red, '#4ade80', '#f8fafc'];
@@ -1451,6 +1714,17 @@
 
     if (g.forecastPending) {
       box.hidden = false;
+      if (Net.online && Net.forecastBy !== Net.seat) {
+        const who = Net.forecastBy != null ? g.players[Net.forecastBy].name : 'Another player';
+        const dlg = el('div', { class: 'dialog' });
+        dlg.append(el('h2', {}, '🔮 Forecast'));
+        dlg.append(el('p', { class: 'sub' }, `${who} is rearranging the top of the infection deck…`));
+        const row = el('div', { class: 'handpick' });
+        g.forecastPending.forEach(c => row.append(cardChip({ type: 'city', city: c.city, color: c.color })));
+        dlg.append(row);
+        box.append(dlg);
+        return;
+      }
       if (!ui.forecastOrder || ui.forecastOrder.length !== g.forecastPending.length) {
         ui.forecastOrder = g.forecastPending.map((_, i) => i);
       }
@@ -1491,10 +1765,10 @@
       dlg.append(listBox);
       dlg.append(el('div', { class: 'btnrow' },
         el('button', {
-          class: 'primary', onclick: () => {
+          class: 'primary', onclick: async () => {
             const o = ui.forecastOrder || g.forecastPending.map((_, i) => i);
             ui.forecastOrder = null;
-            if (run(() => Game.forecastCommit(o))) sfx('click');
+            if ((await run('forecastCommit', [o])).ok) sfx('click');
           },
         }, 'Confirm order')));
       box.append(dlg);
@@ -1517,13 +1791,18 @@
       });
       const btns = el('div', { class: 'btnrow' });
       for (const h of rpHolders) {
+        if (!mySeatIs(h.i)) continue;
         btns.append(el('button', {
           onclick: () => playEventFlow(h.i, h.source, 'Resilient Population'),
         }, `${g.players[h.i].name}: play Resilient Population now`));
       }
-      btns.append(el('button', {
-        class: 'primary', onclick: () => { if (run(() => Game.intensify())) sfx('draw'); },
-      }, 'Intensify (shuffle discard on top)'));
+      if (myTurn()) {
+        btns.append(el('button', {
+          class: 'primary', onclick: async () => { if ((await run('intensify', [])).ok) sfx('draw'); },
+        }, 'Intensify (shuffle discard on top)'));
+      } else {
+        btns.append(el('span', { class: 'sub' }, `Waiting for ${g.players[g.current].name} to intensify…`));
+      }
       dlg.append(btns);
       box.append(dlg);
       return;
@@ -1534,6 +1813,13 @@
       box.classList.add('docked'); // map stays visible & pannable behind this one
       const pi = g.discardQueue[0];
       const p = g.players[pi];
+      if (Net.online && pi !== Net.seat) {
+        const dlg = el('div', { class: 'dialog' });
+        dlg.append(el('h2', {}, `${p.name}: hand limit exceeded`));
+        dlg.append(el('p', { class: 'sub' }, `Waiting for ${p.name} to discard down to ${Game.HAND_LIMIT} cards…`));
+        box.append(dlg);
+        return;
+      }
       const dlg = el('div', { class: 'dialog' });
       dlg.append(el('h2', {}, `${p.name}: hand limit exceeded`));
       dlg.append(el('p', { class: 'sub' }, `Discard down to ${Game.HAND_LIMIT} cards (${p.hand.length} in hand). Click a card to discard it — or play an event instead. You can still pan and zoom the map behind this panel.`));
@@ -1541,12 +1827,12 @@
       p.hand.forEach((c, i) => {
         if (c.type === 'event') {
           hand.append(cardChip(c, {
-            onclick: () => run(() => Game.discardForLimit(pi, i)),
+            onclick: () => run('discardForLimit', [pi, i]),
             onPlay: () => playEventFlow(pi, 'hand', c.event),
             playDisabled: !Game.canPlayEvent(c.event),
           }));
         } else {
-          hand.append(cardChip(c, { onclick: () => run(() => Game.discardForLimit(pi, i)) }));
+          hand.append(cardChip(c, { onclick: () => run('discardForLimit', [pi, i]) }));
         }
       });
       dlg.append(hand);
@@ -1595,6 +1881,107 @@
     box.innerHTML = '';
   }
 
+  // ================= News ticker =================
+  // The storyline (log entries with cls 'news') scrolls across the bottom of
+  // the screen like a broadcast ticker: new headlines enter from the right as
+  // they happen, and the most recent ones stay in rotation.
+
+  const TICKER_KEEP = 6;    // headlines kept in rotation
+  const TICKER_SPEED = 80;  // px per second
+
+  const ticker = { seen: 0, items: [], ri: 0, x: null, last: 0, raf: 0 };
+
+  function tickerItem(msg) {
+    return el('span', { class: 'tickeritem' }, el('span', { class: 'tickersep' }, '✦'), msg);
+  }
+
+  function syncTicker() {
+    const bar = $('#ticker');
+    const g = G();
+    if (!g) { bar.hidden = true; return; }
+    bar.hidden = false;
+    const news = g.log.filter(e => e.cls === 'news').map(e => e.msg.replace(/^📰 /, ''));
+    if (news.length < ticker.seen) {
+      // New game, undo, or trimmed log: restart from what's there, replaying
+      // at most one rotation's worth so a fresh game shows its intro beats.
+      ticker.items = []; ticker.ri = 0; ticker.x = null; ticker.raf = 0;
+      $('#tickertrack').innerHTML = '';
+      ticker.seen = Math.max(0, news.length - TICKER_KEEP);
+    }
+    const track = $('#tickertrack');
+    for (const msg of news.slice(ticker.seen)) {
+      ticker.items.push(msg);
+      if (ticker.items.length > TICKER_KEEP) ticker.items.shift();
+      track.append(tickerItem(msg)); // enters from the right as it happens
+    }
+    ticker.seen = news.length;
+    if (track.children.length && !ticker.raf) {
+      if (ticker.x === null) ticker.x = $('#tickerwrap').clientWidth + 20;
+      ticker.last = performance.now();
+      ticker.raf = requestAnimationFrame(tickerStep);
+    }
+  }
+
+  function tickerStep(now) {
+    const track = $('#tickertrack');
+    const wrapW = $('#tickerwrap').clientWidth;
+    const dt = Math.min(0.1, (now - ticker.last) / 1000); // clamp background-tab gaps
+    ticker.last = now;
+    ticker.x -= TICKER_SPEED * dt;
+    // Drop headlines that have fully scrolled off the left edge.
+    while (track.firstElementChild) {
+      const w = track.firstElementChild.getBoundingClientRect().width;
+      if (ticker.x + w < -10) { track.firstElementChild.remove(); ticker.x += w; }
+      else break;
+    }
+    // Keep the stream continuous: when the tail nears the right edge, feed in
+    // the next headline from the rotation.
+    if (ticker.items.length && ticker.x + track.getBoundingClientRect().width < wrapW + 30) {
+      track.append(tickerItem(ticker.items[ticker.ri++ % ticker.items.length]));
+    }
+    track.style.transform = `translateX(${ticker.x}px)`;
+    if (track.children.length) ticker.raf = requestAnimationFrame(tickerStep);
+    else { ticker.raf = 0; ticker.x = null; }
+  }
+
+  // ================= AI turns =================
+  // When the current player is an AI, advance the game one engine call at a
+  // time on a timer, so humans can watch the bot think. Local games only —
+  // online rooms are driven by the server.
+
+  let aiTimer = null;
+
+  function aiDue() {
+    const g = G();
+    if (!g || g.result || (globalThis.Net && Net.online) || !globalThis.AI) return false;
+    if (g.forecastPending) return !!g.players[g.current].ai;
+    if (g.phase === 'discard') return !!g.players[g.discardQueue[0]] && !!g.players[g.discardQueue[0]].ai;
+    return !!g.players[g.current].ai;
+  }
+
+  function scheduleAI() {
+    if (aiTimer || !aiDue()) return;
+    aiTimer = setTimeout(() => {
+      aiTimer = null;
+      if (!aiDue()) return;
+      const g = G();
+      try {
+        const logMark = g.log.length;
+        const did = AI.step(g.players[g.current].ai || g.players[g.discardQueue[0]].ai);
+        if (did) {
+          animateOutbreaks(logMark);
+          sfx('click');
+        } else if (g.phase === 'actions' && !g.result) {
+          Game.pass(); // never let a stuck bot freeze the table
+        }
+      } catch (e) {
+        console.error('AI step failed:', e);
+        try { if (G().phase === 'actions') Game.pass(); } catch (e2) { /* leave it to the next tick */ }
+      }
+      refresh(); // re-schedules if the AI still has work to do
+    }, 700);
+  }
+
   // ================= Main refresh =================
 
   function refresh() {
@@ -1614,14 +2001,48 @@
     renderPlayers();
     renderStatus();
     renderLog();
+    syncTicker();
     renderStateModal();
     save();
+    scheduleAI();
     // animate turn hand-offs
     const key = `${g.turn}:${g.current}`;
     if (ui.turnKey !== key && g.phase === 'actions' && !g.result) {
       ui.turnKey = key;
       showTurnBanner();
     }
+  }
+
+  // Online: every applied server payload lands here (from SSE or a POST echo).
+  // Routes between lobby and board, then replays other players' action beats.
+  Net.onUpdate = (p, prevLogLen) => {
+    if (!Net.online) return;
+    if (Net.status === 'lobby') { showLobby(); return; }
+    $('#setup').hidden = true;
+    $('#app').hidden = false;
+    refresh();
+    if (p && p.state && prevLogLen >= 0 && p.actorSeat !== Net.seat) animateRemote(prevLogLen);
+  };
+
+  // Replay the visual beats of someone else's action from the log entries the
+  // new state added. Pure flavor — never touches game state. The 25-entry cap
+  // skips bulk catch-ups (fresh joins, reconnects after a long gap).
+  function animateRemote(logMark) {
+    const entries = G().log.slice(logMark);
+    if (!entries.length || entries.length > 25) return;
+    let infected = false, epidemic = false;
+    for (const e of entries) {
+      let m;
+      if ((m = e.msg.match(/^Epidemic strikes (.+)\.$/))) { epidemic = true; epicenter(m[1]); }
+      else if ((m = e.msg.match(/^(.+?) infected \((blue|yellow|black|red):/))) { infected = true; cityPulse(m[1], HEX[m[2]]); }
+      else if ((m = e.msg.match(/ moves(?: .+?)? to (.+?) \((drive|shuttle|direct|charter|dispatch|opex)\)\.$/))) { cityPulse(m[1], '#38bdf8'); }
+      else if ((m = e.msg.match(/^Airlift: .+? flies to (.+?)\.$/))) { cityPulse(m[1], '#4ade80'); }
+      else if ((m = e.msg.match(/discovers a CURE for the (blue|yellow|black|red) disease/))) { sfx('cure'); cureBanner(m[1]); }
+    }
+    if (epidemic) sfx('epidemic');
+    else if (entries.some(e => /^OUTBREAK/.test(e.msg))) { /* outbreakBlast plays its own sfx */ }
+    else if (infected) sfx('infect');
+    animateOutbreaks(logMark); // chains outbreak blasts exactly like local play
   }
 
   // ================= Boot =================
@@ -1640,22 +2061,41 @@
 
   initMapControls();
 
-  // Auto-resume: an unfinished game in localStorage picks up exactly where it left off.
-  const autosave = localStorage.getItem(SAVE_KEY);
-  let resumed = false;
-  if (autosave) {
-    try {
-      const g = Game.load(autosave);
-      if (g && g.players && !g.result) {
-        $('#app').hidden = false;
-        ui.undoStack = [];
-        refresh();
-        toast('Saved game resumed.');
-        resumed = true;
+  (async function boot() {
+    // 1) an online session resumes first (room code + token in localStorage)
+    const sess = Net.session();
+    if (sess && await Net.detect()) {
+      try {
+        await Net.join(sess.code, null, sess.token);
+        toast('Rejoined online game.');
+        return; // SSE payload routes to lobby or board via Net.onUpdate
+      } catch (e) {
+        Net.leave(); // room gone or token stale — fall through to local flow
       }
-    } catch (e) {
-      localStorage.removeItem(SAVE_KEY);
     }
-  }
-  if (!resumed) showSetup();
+    // 2) an unfinished local game picks up exactly where it left off
+    const autosave = localStorage.getItem(SAVE_KEY);
+    if (autosave) {
+      try {
+        const g = Game.load(autosave);
+        const integrity = Game.validate(g);
+        if (!integrity.ok) {
+          // A historical bug corrupted this save (e.g. duplicated cards) — do
+          // not resume it; playing on would only deepen the damage.
+          console.warn('Corrupted save discarded:', integrity.problems);
+          localStorage.removeItem(SAVE_KEY);
+          toast('Saved game was corrupted and has been discarded — please start a new game.');
+        } else if (g && g.players && !g.result) {
+          $('#app').hidden = false;
+          ui.undoStack = [];
+          refresh();
+          toast('Saved game resumed.');
+          return;
+        }
+      } catch (e) {
+        localStorage.removeItem(SAVE_KEY);
+      }
+    }
+    showSetup();
+  })();
 })();
