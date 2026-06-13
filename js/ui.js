@@ -85,6 +85,33 @@
     if (actx.state === 'suspended') actx.resume();
     return actx;
   }
+  // All parts of one effect play on a shared bus; each NEW effect ramps the
+  // previous bus out in ~40ms first, so rapid actions cut stale sound instead
+  // of stacking scheduled tones on top of each other.
+  let sfxBus = null;
+  function bus() {
+    if (!sfxBus) {
+      const ctx = audio();
+      sfxBus = ctx.createGain();
+      sfxBus.gain.value = 1;
+      sfxBus.connect(ctx.destination);
+    }
+    return sfxBus;
+  }
+  function cutSfx() {
+    if (!sfxBus) return;
+    const old = sfxBus;
+    sfxBus = null;
+    try {
+      const t = audio().currentTime;
+      old.gain.cancelScheduledValues(t);
+      old.gain.setValueAtTime(old.gain.value, t);
+      old.gain.linearRampToValueAtTime(0.0001, t + 0.04);
+      setTimeout(() => { try { old.disconnect(); } catch (e) { /* already gone */ } }, 120);
+    } catch (e) {
+      try { old.disconnect(); } catch (e2) { /* already gone */ }
+    }
+  }
   function tone(freq, at, dur, type, vol, slideTo) {
     const ctx = audio(), t = ctx.currentTime + at;
     const o = ctx.createOscillator(), g = ctx.createGain();
@@ -94,7 +121,7 @@
     g.gain.setValueAtTime(0.0001, t);
     g.gain.linearRampToValueAtTime(vol, t + 0.012);
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-    o.connect(g).connect(ctx.destination);
+    o.connect(g).connect(bus());
     o.start(t); o.stop(t + dur + 0.05);
   }
   function whoosh(at, dur, vol, cutoff) {
@@ -107,7 +134,7 @@
     const g = ctx.createGain();
     g.gain.setValueAtTime(vol, t);
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-    src.connect(f).connect(g).connect(ctx.destination);
+    src.connect(f).connect(g).connect(bus());
     src.start(t);
   }
   const SFX = {
@@ -121,6 +148,8 @@
     infect: () => { tone(220, 0, 0.32, 'sawtooth', 0.13, 110); whoosh(0, 0.3, 0.1, 420); },
     epidemic: () => { [0, 0.22, 0.44].forEach(at => tone(165, at, 0.2, 'sawtooth', 0.26, 82)); whoosh(0, 0.8, 0.22, 300); },
     outbreak: () => { tone(90, 0, 0.5, 'sawtooth', 0.3, 45); whoosh(0, 0.5, 0.3, 240); },
+    // chained outbreaks: a fast sharp crack + rising zap instead of the full rumble
+    outbreakChain: () => { tone(110, 0, 0.2, 'sawtooth', 0.3, 55); tone(420, 0.02, 0.12, 'square', 0.1, 1100); whoosh(0, 0.18, 0.25, 700); },
     turn: () => { tone(587, 0, 0.12, 'sine', 0.14); tone(880, 0.11, 0.18, 'sine', 0.14); },
     error: () => tone(170, 0, 0.16, 'square', 0.1, 120),
     click: () => tone(430, 0, 0.06, 'sine', 0.1),
@@ -129,7 +158,7 @@
   };
   function sfx(name) {
     if (muted) return;
-    try { SFX[name] && SFX[name](); } catch (e) { /* audio blocked until first gesture */ }
+    try { cutSfx(); SFX[name] && SFX[name](); } catch (e) { /* audio blocked until first gesture */ }
   }
 
   // ================= Storyteller narration (spoken news) =================
@@ -137,7 +166,11 @@
   // voiceover clip (audio/narration/<id>.mp3) when the beat carries an `audio`
   // id, otherwise the browser's built-in speech synthesizer as a fallback for
   // the dynamic lines. Clips are produced by tools/generate-narration.mjs.
-  const MAX_NARRATION_QUEUE = 8; // outbreak chains can emit many beats at once
+  // Keep the spoken backlog tiny: the line being spoken plus a couple pending.
+  // Long chains drop their oldest beats — a narrator minutes behind the board
+  // is worse than one that skips. User actions also cut stale speech outright
+  // (see cutStaleNarration in dispatch()).
+  const MAX_NARRATION_QUEUE = 2;
   const speech = { seen: 0, primed: false, queue: [], playing: false, audioEl: null };
 
   // Establish the baseline so we don't replay an existing backlog. fromStart
@@ -239,7 +272,15 @@
   // Online mode: POST to the server; the echoed payload updates the mirrored
   // state before the promise resolves. Always returns a Promise of {ok, ret}
   // so call sites can fire sounds/animations only on success.
+  // A fresh user action makes queued narration stale history — cut it so the
+  // voice tracks the present instead of falling ever further behind. The seen
+  // pointer is untouched, so only beats from the new action get spoken.
+  function cutStaleNarration() {
+    if (narrator && (speech.playing || speech.queue.length)) stopNarration();
+  }
+
   async function dispatch(fn, args, undoable) {
+    cutStaleNarration();
     if (!globalThis.Net || !Net.online) {
       const snap = undoable ? Game.snapshot() : null;
       let ok = false, ret;
@@ -1522,10 +1563,12 @@
   // finishes its city-by-city spread before the next outbreak begins.
   function animateOutbreaks(logMark) {
     const entries = G().log.slice(logMark);
-    let at = 800;
+    let at = 800, seen = 0;
     for (const e of entries) {
       const m = e.msg.match(/^OUTBREAK of (\w+) in (.+?)!/);
-      if (m) at += outbreakBlast(m[2], m[1], at);
+      // the first outbreak gets the full cinematic; chained follow-ups get the
+      // quick variant so a long chain doesn't replay the whole show per city
+      if (m) at += outbreakBlast(m[2], m[1], at, seen++ > 0);
     }
   }
 
@@ -1679,37 +1722,40 @@
   // Outbreak at a city: zoom in, shake, detonate, then send the disease down
   // each edge to its neighbors ONE BY ONE so the spread can be watched.
   // Returns the total duration so chained outbreaks can queue up after it.
-  function outbreakBlast(city, color, delay) {
+  function outbreakBlast(city, color, delay, quick) {
     const c = Game.CITY[city];
     if (!c) return 0;
     const neighbors = Game.ADJ[city];
-    const SPREAD_GAP = 480, SPREAD_DUR = 420, LEAD = 950;
-    const total = LEAD + neighbors.length * SPREAD_GAP + SPREAD_DUR + 500;
+    // quick = a chained outbreak: compressed timings, sharper sound, no
+    // per-neighbor infect stingers — the chain crackles along instead of
+    // restaging the full cinematic for every city.
+    const SPREAD_GAP = quick ? 160 : 480, SPREAD_DUR = quick ? 260 : 420, LEAD = quick ? 350 : 950;
+    const total = LEAD + neighbors.length * SPREAD_GAP + SPREAD_DUR + (quick ? 250 : 500);
     setTimeout(() => {
-      sfx('outbreak');
-      animateViewTo(c.x, c.y, 520);
+      sfx(quick ? 'outbreakChain' : 'outbreak');
+      animateViewTo(c.x, c.y, quick ? 300 : 520);
       const wrap = $('#mapwrap');
       wrap.classList.add('shake');
-      setTimeout(() => wrap.classList.remove('shake'), 600);
+      setTimeout(() => wrap.classList.remove('shake'), quick ? 320 : 600);
       const map = $('#map');
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0; i < (quick ? 2 : 3); i++) {
         const ring = svg('circle', {
           class: 'shockwave', cx: c.x, cy: c.y,
-          style: `stroke:${HEX[color]};animation-delay:${i * 280}ms`,
+          style: `stroke:${HEX[color]};animation-delay:${i * (quick ? 150 : 280)}ms`,
         });
         map.append(ring);
         setTimeout(() => ring.remove(), 2100 + i * 280);
       }
       const lbl = svg('text', {
         class: 'epilabel', x: c.x, y: c.y - 36, 'text-anchor': 'middle',
-        style: `fill:${HEX[color]}`,
-      }, `💥 OUTBREAK — ${city}`);
+        style: `fill:${HEX[color]}` + (quick ? ';font-size:19px' : ''),
+      }, quick ? `⚡ CHAIN — ${city}` : `💥 OUTBREAK — ${city}`);
       map.append(lbl);
-      setTimeout(() => lbl.remove(), total - delay > 2800 ? total : 2800);
+      setTimeout(() => lbl.remove(), quick ? 2000 : (total - delay > 2800 ? total : 2800));
       neighbors.forEach((n, i) => {
         const t = Game.CITY[n];
         travelDot(c, t, HEX[color], LEAD + i * SPREAD_GAP, SPREAD_DUR);
-        setTimeout(() => sfx('infect'), LEAD + i * SPREAD_GAP);
+        if (!quick) setTimeout(() => sfx('infect'), LEAD + i * SPREAD_GAP);
       });
     }, delay);
     return total;
